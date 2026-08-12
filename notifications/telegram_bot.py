@@ -1,60 +1,98 @@
+"""
+텔레그램 봇 완전 구현.
+TELEGRAM_BOT_TOKEN 없으면 조용히 스킵 (에러 없이).
+있으면 /status /portfolio /stop /start /watchlist 명령 지원.
+매수/매도 체결 시 자동 알림.
+"""
 import asyncio
 from datetime import datetime
 from typing import Any
 
 from loguru import logger
-from telegram import Update
-from telegram.ext import Application, CommandHandler, ContextTypes
 
 from config.settings import TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID
 
-_app: Application | None = None
+_app: Any = None   # telegram.ext.Application
 
 
-def _get_app() -> Application | None:
+def _get_app() -> Any:
     global _app
-    if _app is None and TELEGRAM_BOT_TOKEN:
+    if not TELEGRAM_BOT_TOKEN:
+        return None
+    if _app is not None:
+        return _app
+    try:
+        from telegram.ext import Application, CommandHandler
         _app = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
-        _register_handlers(_app)
+        _app.add_handler(CommandHandler("status",    cmd_status))
+        _app.add_handler(CommandHandler("portfolio", cmd_portfolio))
+        _app.add_handler(CommandHandler("stop",      cmd_stop))
+        _app.add_handler(CommandHandler("start",     cmd_start))
+        _app.add_handler(CommandHandler("watchlist", cmd_watchlist))
+        logger.info("[Telegram] 봇 핸들러 등록 완료")
+    except Exception as e:
+        logger.warning(f"[Telegram] 봇 초기화 실패: {e}")
+        _app = None
     return _app
 
 
-def _register_handlers(app: Application) -> None:
-    app.add_handler(CommandHandler("status", cmd_status))
-    app.add_handler(CommandHandler("stop", cmd_stop))
-    app.add_handler(CommandHandler("portfolio", cmd_portfolio))
-
-
+# ──────────────────────────────────────────────
+# 내부 전송 헬퍼
+# ──────────────────────────────────────────────
 async def _send(text: str) -> None:
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
-        logger.debug(f"[Telegram] 설정 없음, 건너뜀: {text[:50]}")
+        logger.debug(f"[Telegram] 설정 없음, 건너뜀: {text[:60]}")
         return
     app = _get_app()
     if app is None:
         return
     try:
-        await app.bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=text, parse_mode="HTML")
+        await app.bot.send_message(
+            chat_id=TELEGRAM_CHAT_ID,
+            text=text,
+            parse_mode="HTML",
+        )
     except Exception as e:
         logger.warning(f"[Telegram] 전송 실패: {e}")
 
 
+# ──────────────────────────────────────────────
+# 자동 알림 함수
+# ──────────────────────────────────────────────
 async def notify_start() -> None:
-    await _send("🟢 <b>봇 시작</b>\n장 모니터링을 시작합니다.")
+    now = datetime.now().strftime("%H:%M:%S")
+    await _send(
+        f"🟢 <b>봇 시작</b>\n"
+        f"시각: {now}\n"
+        f"장 모니터링을 시작합니다. 올랜도킴 전략 적용 중."
+    )
 
 
 async def notify_stop() -> None:
-    await _send("🔴 <b>봇 중지</b>\n킬스위치 발동.")
+    now = datetime.now().strftime("%H:%M:%S")
+    await _send(
+        f"🔴 <b>봇 중지</b>\n"
+        f"시각: {now}\n"
+        f"킬스위치 발동. 모든 자동매매 중단."
+    )
 
 
 async def notify_trade(action: str, ticker: str, qty: int, reason: str) -> None:
-    emoji = "📈" if action == "BUY" else "📉"
-    text = (
-        f"{emoji} <b>{action} 체결</b>\n"
-        f"종목: {ticker}\n"
-        f"수량: {qty}주\n"
+    if action == "BUY":
+        emoji = "📈"
+        action_kr = "매수 체결"
+    else:
+        emoji = "📉"
+        action_kr = "매도 체결"
+
+    now = datetime.now().strftime("%H:%M:%S")
+    await _send(
+        f"{emoji} <b>{action_kr}</b>\n"
+        f"종목: <code>{ticker}</code>\n"
+        f"수량: {qty:,}주\n"
+        f"시각: {now}\n"
         f"근거: {reason}"
     )
-    await _send(text)
 
 
 async def notify_positions(positions: list[dict[str, Any]]) -> None:
@@ -65,55 +103,115 @@ async def notify_positions(positions: list[dict[str, Any]]) -> None:
     for p in positions:
         pnl = p.get("pnl_pct", 0)
         sign = "+" if pnl >= 0 else ""
-        lines.append(f"  {p['symbol']}: {p['quantity']}주 ({sign}{pnl:.1f}%)")
+        emoji = "🟢" if pnl >= 0 else "🔴"
+        lines.append(
+            f"  {emoji} <code>{p['symbol']}</code> {p['quantity']}주 "
+            f"({sign}{pnl:.1f}%)"
+        )
     await _send("\n".join(lines))
 
 
-async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    from core.engine import TradingEngine
-    engine = TradingEngine()
-    status = "가동중 🟢" if engine.running else "중지 🔴"
-    mode = "모의" if engine.is_paper else "실전"
-    positions = await engine.get_positions()
-    await update.message.reply_text(
-        f"<b>봇 상태</b>: {status}\n"
-        f"<b>모드</b>: {mode}\n"
-        f"<b>보유 종목</b>: {len(positions)}개\n"
-        f"<b>LLM 호출</b>: {engine.llm_call_count}회",
-        parse_mode="HTML",
-    )
+# ──────────────────────────────────────────────
+# 명령어 핸들러
+# ──────────────────────────────────────────────
+async def cmd_status(update: Any, context: Any) -> None:
+    try:
+        from core.engine import TradingEngine
+        engine = TradingEngine()
+        status = "가동중 🟢" if engine.running else "중지 🔴"
+        mode = "데모" if engine.demo_mode else ("모의" if engine.is_paper else "실전")
+        positions = await engine.get_positions()
+        uptime = int(engine.uptime_seconds())
+        h, r = divmod(uptime, 3600)
+        m, s = divmod(r, 60)
+        uptime_str = f"{h}h {m}m {s}s" if h else f"{m}m {s}s"
+        await update.message.reply_text(
+            f"<b>봇 상태</b>: {status}\n"
+            f"<b>모드</b>: {mode}\n"
+            f"<b>가동시간</b>: {uptime_str}\n"
+            f"<b>보유 종목</b>: {len(positions)}개 / 4\n"
+            f"<b>LLM 호출</b>: {engine.llm_call_count}회",
+            parse_mode="HTML",
+        )
+    except Exception as e:
+        await update.message.reply_text(f"오류: {e}")
 
 
-async def cmd_stop(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    from core.engine import TradingEngine
-    engine = TradingEngine()
-    if engine.running:
-        await engine.stop()
-        await update.message.reply_text("🔴 봇을 중지했습니다.")
-    else:
-        await update.message.reply_text("이미 중지 상태입니다.")
+async def cmd_portfolio(update: Any, context: Any) -> None:
+    try:
+        from core.engine import TradingEngine
+        engine = TradingEngine()
+        pf = await engine.get_portfolio()
+        ret = pf.get("return_pct", 0)
+        sign = "+" if ret >= 0 else ""
+        emoji = "📈" if ret >= 0 else "📉"
+        await update.message.reply_text(
+            f"{emoji} <b>포트폴리오</b>\n"
+            f"총평가액: <b>{pf.get('total_value', 0):,.0f}원</b>\n"
+            f"현금: {pf.get('cash', 0):,.0f}원\n"
+            f"수익률: {sign}{ret:.2f}%",
+            parse_mode="HTML",
+        )
+    except Exception as e:
+        await update.message.reply_text(f"오류: {e}")
 
 
-async def cmd_portfolio(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    from core.engine import TradingEngine
-    engine = TradingEngine()
-    pf = await engine.get_portfolio()
-    sign = "+" if pf.get("return_pct", 0) >= 0 else ""
-    await update.message.reply_text(
-        f"<b>포트폴리오</b>\n"
-        f"총평가액: {pf.get('total_value', 0):,.0f}원\n"
-        f"현금: {pf.get('cash', 0):,.0f}원\n"
-        f"수익률: {sign}{pf.get('return_pct', 0):.2f}%",
-        parse_mode="HTML",
-    )
+async def cmd_stop(update: Any, context: Any) -> None:
+    try:
+        from core.engine import TradingEngine
+        engine = TradingEngine()
+        if engine.running:
+            await engine.stop()
+            await update.message.reply_text("🔴 봇을 중지했습니다.")
+        else:
+            await update.message.reply_text("이미 중지 상태입니다.")
+    except Exception as e:
+        await update.message.reply_text(f"오류: {e}")
 
 
+async def cmd_start(update: Any, context: Any) -> None:
+    try:
+        from core.engine import TradingEngine
+        engine = TradingEngine()
+        if not engine.running:
+            await engine.start()
+            await update.message.reply_text("🟢 봇을 시작했습니다.")
+        else:
+            await update.message.reply_text("이미 가동 중입니다.")
+    except Exception as e:
+        await update.message.reply_text(f"오류: {e}")
+
+
+async def cmd_watchlist(update: Any, context: Any) -> None:
+    try:
+        from core.engine import TradingEngine
+        engine = TradingEngine()
+        items = await engine.get_watchlist()
+        if not items:
+            await update.message.reply_text("관심종목이 없습니다.")
+            return
+        lines = ["📋 <b>관심종목</b>"]
+        for item in items:
+            price_str = f"{item['current_price']:,.0f}" if item.get('current_price') else "-"
+            dist_str = f"고점까지 -{item['pct_from_high']:.1f}%" if item.get('pct_from_high') is not None else ""
+            lines.append(f"  <code>{item['ticker']}</code> {item.get('name','')} {price_str} {dist_str}")
+        await update.message.reply_text("\n".join(lines), parse_mode="HTML")
+    except Exception as e:
+        await update.message.reply_text(f"오류: {e}")
+
+
+# ──────────────────────────────────────────────
+# Polling 실행
+# ──────────────────────────────────────────────
 async def run_polling() -> None:
     app = _get_app()
     if app is None:
-        logger.warning("[Telegram] 토큰 없음, polling 생략")
+        logger.info("[Telegram] 토큰 없음, polling 생략")
         return
-    await app.initialize()
-    await app.start()
-    await app.updater.start_polling()
-    logger.info("[Telegram] polling 시작")
+    try:
+        await app.initialize()
+        await app.start()
+        await app.updater.start_polling()
+        logger.info("[Telegram] polling 시작")
+    except Exception as e:
+        logger.warning(f"[Telegram] polling 시작 실패: {e}")

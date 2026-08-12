@@ -1,14 +1,16 @@
 import asyncio
+import os
 from datetime import datetime, time as dtime
 from typing import Any
 
 from loguru import logger
 
 from config.settings import KIS_MOCK
-from core.data_fetcher import DataFetcher
 from core.llm_judge import LLMJudge
 from database.db import get_db
 from database.models import PositionRepository, TradeRepository
+
+DEMO_MODE: bool = os.getenv("DEMO_MODE", "false").lower() == "true"
 
 
 class TradingEngine:
@@ -27,6 +29,7 @@ class TradingEngine:
 
         self.running = False
         self.is_paper = KIS_MOCK
+        self.demo_mode = DEMO_MODE
         self._started_at: datetime | None = None
         self.last_tick: datetime | None = None
         self.llm_call_count = 0
@@ -35,7 +38,15 @@ class TradingEngine:
         self._watchlist: dict[str, str] = {}
         self._task: asyncio.Task | None = None
 
-        self.fetcher = DataFetcher()
+        if DEMO_MODE:
+            logger.info("[Engine] DEMO_MODE 활성화 — 실제 API 없이 동작합니다")
+            from core.demo_data import get_demo_watchlist
+            for item in get_demo_watchlist():
+                self._watchlist[item["ticker"]] = item["name"]
+        else:
+            from core.data_fetcher import DataFetcher
+            self.fetcher = DataFetcher()
+
         self.judge = LLMJudge()
         self.position_repo = PositionRepository(get_db())
         self.trade_repo = TradeRepository(get_db())
@@ -67,7 +78,7 @@ class TradingEngine:
     async def _loop(self) -> None:
         while self.running:
             try:
-                if self._is_market_hours():
+                if DEMO_MODE or self._is_market_hours():
                     await self._tick()
                 await asyncio.sleep(30)
             except asyncio.CancelledError:
@@ -87,12 +98,17 @@ class TradingEngine:
             return
 
         market_data: dict[str, Any] = {}
-        for ticker in tickers:
-            try:
-                data = await self.fetcher.fetch(ticker)
-                market_data[ticker] = data
-            except Exception as e:
-                logger.warning(f"[Engine] {ticker} 시세 조회 실패: {e}")
+        if DEMO_MODE:
+            from core.demo_data import get_demo_ticker
+            for ticker in tickers:
+                market_data[ticker] = get_demo_ticker(ticker)
+        else:
+            for ticker in tickers:
+                try:
+                    data = await self.fetcher.fetch(ticker)
+                    market_data[ticker] = data
+                except Exception as e:
+                    logger.warning(f"[Engine] {ticker} 시세 조회 실패: {e}")
 
         positions = await self.get_positions()
 
@@ -124,6 +140,9 @@ class TradingEngine:
         asyncio.create_task(_safe(notify_trade(action, ticker, qty, decision.get("reason", ""))))
 
     async def get_portfolio(self) -> dict[str, Any]:
+        if DEMO_MODE:
+            from core.demo_data import get_demo_portfolio
+            return get_demo_portfolio()
         try:
             data = await self.fetcher.fetch_portfolio()
             return data
@@ -132,6 +151,9 @@ class TradingEngine:
             return {"total_value": 0, "cash": 0, "return_pct": 0.0}
 
     async def get_positions(self) -> list[dict[str, Any]]:
+        if DEMO_MODE:
+            from core.demo_data import get_demo_positions
+            return get_demo_positions()
         try:
             records = self.position_repo.find_all()
             result = []
@@ -170,7 +192,11 @@ class TradingEngine:
         for ticker, name in self._watchlist.items():
             item: dict[str, Any] = {"ticker": ticker, "name": name or ticker}
             try:
-                data = await self.fetcher.fetch(ticker)
+                if DEMO_MODE:
+                    from core.demo_data import get_demo_ticker
+                    data = get_demo_ticker(ticker)
+                else:
+                    data = await self.fetcher.fetch(ticker)
                 item["current_price"] = data.get("current_price", 0)
                 item["week52_high"] = data.get("week52_high", 0)
                 high = data.get("week52_high", 0)
@@ -185,6 +211,14 @@ class TradingEngine:
                 item["pct_from_high"] = None
             result.append(item)
         return result
+
+    async def get_return_history(self) -> list[dict[str, Any]]:
+        """30일 수익률 추이. 데모 모드에서는 샘플 데이터 반환."""
+        if DEMO_MODE:
+            from core.demo_data import get_demo_return_history
+            return get_demo_return_history(30)
+        # 실전: DB에서 집계 (현재는 빈 배열)
+        return []
 
     def add_to_watchlist(self, ticker: str, name: str = "") -> None:
         self._watchlist[ticker] = name

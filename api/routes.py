@@ -20,6 +20,7 @@ async def get_status() -> dict[str, Any]:
     return {
         "running": engine.running,
         "mode": "paper" if engine.is_paper else "live",
+        "demo_mode": engine.demo_mode,
         "uptime_seconds": engine.uptime_seconds(),
         "last_tick": engine.last_tick.isoformat() if engine.last_tick else None,
         "llm_call_count": engine.llm_call_count,
@@ -72,3 +73,8 @@ async def add_watchlist(req: WatchlistAddRequest) -> dict[str, str]:
 async def remove_watchlist(ticker: str) -> dict[str, str]:
     engine.remove_from_watchlist(ticker)
     return {"status": "removed", "ticker": ticker}
+
+
+@router.get("/return-history")
+async def get_return_history() -> list[dict[str, Any]]:
+    return await engine.get_return_history()
