@@ -12,7 +12,7 @@ SYSTEM_PROMPT = """당신은 올랜도킴 매매 전략을 따르는 AI 트레�
 3. 52주 고점 돌파 시 강력 매수 신호
 4. 손절선: 매수가 -3.5%
 5. 익절: +4% ~ +8% 구간에서 단계적 청산
-6. 동시 보유 최대 4종목, 종목당 최대 시드의 25%
+6. 동시 보유 최대 4종목, 종목당 최대 시드의 25% (250만원)
 7. 시장 전체 하락장(코스피 -1.5% 이하)에서는 신규 매수 금지
 
 ## 응답 형식 (반드시 JSON만 반환)
@@ -28,35 +28,6 @@ SYSTEM_PROMPT = """당신은 올랜도킴 매매 전략을 따르는 AI 트레�
 
 _ANTHROPIC_API_KEY: str = os.getenv("ANTHROPIC_API_KEY", "")
 
-# 데모용 판단 풀
-_DEMO_REASONS = [
-    "삼성전자가 20일 이동평균선 위에서 거래량 급증 중. 52주 고점 돌파 임박으로 강력 매수 신호.",
-    "SK하이닉스 HBM 수요 증가로 외국인 순매수 지속. MA20 상위에서 목표가 +6% 단계적 익절 예정.",
-    "NVDA 실적 발표 앞두고 옵션 시장 강세. 현재가 MA20 상위 유지 중.",
-    "코스피 전체 -0.8% 하락으로 신규 매수 보류. 현재 포지션 유지 (HOLD).",
-    "AAPL 52주 고점 -2.3% 수준. 거래량 평균 대비 1.7배, 돌파 시 추가 매수 검토.",
-    "LG화학 목표가 도달(-3.5% 손절선 접근). 리스크 관리 차원에서 매도 신호 발생.",
-    "시장 전체 상승세이나 MSFT 거래량 부족 (평균 대비 0.9배). 신뢰도 낮아 관망.",
-    "TSLA 변동성 확대 구간. 올랜도킴 전략상 4종목 보유 한도 검토 필요.",
-    "NAVER 20일 이평선 하향 이탈. 매수 조건 미충족으로 관망 유지.",
-    "삼성SDI 52주 고점 대비 -18% 수준. 반등 가능성 있으나 이평선 조건 미충족.",
-]
-_DEMO_POOL = [
-    {"decision": "BUY",  "ticker": "005930", "quantity": 10, "confidence": 78},
-    {"decision": "BUY",  "ticker": "NVDA",   "quantity": 5,  "confidence": 82},
-    {"decision": "HOLD", "ticker": "",        "quantity": 0,  "confidence": 55},
-    {"decision": "SELL", "ticker": "000660",  "quantity": 8,  "confidence": 71},
-    {"decision": "HOLD", "ticker": "",        "quantity": 0,  "confidence": 62},
-    {"decision": "BUY",  "ticker": "AAPL",   "quantity": 3,  "confidence": 69},
-]
-
-
-def _demo_decision() -> dict[str, Any]:
-    import random
-    base = random.choice(_DEMO_POOL).copy()
-    base["reason"] = random.choice(_DEMO_REASONS)
-    return base
-
 
 class LLMJudge:
     def __init__(self) -> None:
@@ -69,7 +40,7 @@ class LLMJudge:
             except Exception as e:
                 logger.warning(f"[LLM] Anthropic 클라이언트 초기화 실패: {e}")
         else:
-            logger.info("[LLM] ANTHROPIC_API_KEY 없음 — 데모 판단 모드")
+            logger.info("[LLM] ANTHROPIC_API_KEY 없음 — 규칙 기반 판단 모드")
 
     async def judge(
         self,
@@ -78,15 +49,15 @@ class LLMJudge:
         watchlist: dict[str, str],
     ) -> dict[str, Any]:
         if self._client is None:
-            result = _demo_decision()
-            logger.info(f"[LLM] 데모 판단: {result.get('decision')} {result.get('ticker')} "
+            result = self._rule_based_judge(market_data, positions)
+            logger.info(f"[LLM] 규칙 판단: {result.get('decision')} {result.get('ticker')} "
                         f"확신도:{result.get('confidence')}%")
             return result
 
         prompt = self._build_prompt(market_data, positions, watchlist)
         try:
             response = self._client.messages.create(
-                model="claude-sonnet-4-5",
+                model="claude-sonnet-4-6",
                 max_tokens=512,
                 system=SYSTEM_PROMPT,
                 messages=[{"role": "user", "content": prompt}],
@@ -107,6 +78,106 @@ class LLMJudge:
             logger.error(f"[LLM] API 호출 실패: {e}")
             return {"decision": "HOLD", "ticker": "", "quantity": 0, "confidence": 0, "reason": str(e)}
 
+    def _rule_based_judge(
+        self,
+        market_data: dict[str, Any],
+        positions: list[dict[str, Any]],
+    ) -> dict[str, Any]:
+        held_symbols = {p.get("symbol") for p in positions}
+        slot_available = len(held_symbols) < 4
+
+        # 보유 포지션 손절 체크
+        for p in positions:
+            sym = p.get("symbol", "")
+            current = p.get("current_price", 0)
+            stop = p.get("stop_price", 0)
+            target = p.get("target_price", 0)
+            if stop > 0 and current > 0 and current <= stop:
+                return {
+                    "decision": "SELL",
+                    "ticker": sym,
+                    "quantity": p.get("quantity", 1),
+                    "confidence": 90,
+                    "reason": f"손절가 도달. 현재가 {current:,.0f}원이 손절가 {stop:,.0f}원 이하. 즉시 매도.",
+                }
+            if target > 0 and current > 0 and current >= target:
+                return {
+                    "decision": "SELL",
+                    "ticker": sym,
+                    "quantity": p.get("quantity", 1),
+                    "confidence": 85,
+                    "reason": f"익절가 도달. 현재가 {current:,.0f}원이 목표가 {target:,.0f}원 이상. 수익 실현.",
+                }
+
+        if not slot_available:
+            return {
+                "decision": "HOLD",
+                "ticker": "",
+                "quantity": 0,
+                "confidence": 60,
+                "reason": "4종목 보유 한도 도달. 신규 매수 불가.",
+            }
+
+        # 매수 신호 탐색
+        best_ticker = ""
+        best_confidence = 0
+        best_reason = ""
+
+        for ticker, data in market_data.items():
+            if ticker in held_symbols:
+                continue
+
+            above_ma20 = data.get("above_ma20", False)
+            volume_surge = data.get("volume_surge", False)
+            volume_ratio = data.get("volume_ratio", 0)
+            pct_from_high = data.get("pct_from_high", 100)
+            current_price = data.get("current_price", 0)
+            ma20 = data.get("ma20", 0)
+
+            if not above_ma20 or current_price <= 0:
+                continue
+
+            confidence = 50
+            reasons = []
+
+            if above_ma20:
+                confidence += 15
+                reasons.append(f"20일선 위({current_price:,.0f} > MA20 {ma20:,.0f})")
+
+            if volume_surge:
+                confidence += 20
+                reasons.append(f"거래량 급증(평균 대비 {volume_ratio:.1f}배)")
+
+            if pct_from_high is not None and pct_from_high <= 3:
+                confidence += 15
+                reasons.append(f"52주 고점 근접(-{pct_from_high:.1f}%)")
+            elif pct_from_high is not None and pct_from_high <= 10:
+                confidence += 5
+
+            if confidence > best_confidence and volume_surge:
+                best_confidence = confidence
+                best_ticker = ticker
+                best_reason = ". ".join(reasons) + ". 올랜도킴 규칙 충족으로 매수 신호."
+
+        if best_ticker and best_confidence >= 70:
+            price = market_data[best_ticker].get("current_price", 0)
+            qty = max(1, int(2_500_000 // price)) if price > 0 else 1
+            return {
+                "decision": "BUY",
+                "ticker": best_ticker,
+                "quantity": qty,
+                "confidence": best_confidence,
+                "reason": best_reason,
+            }
+
+        return {
+            "decision": "HOLD",
+            "ticker": "",
+            "quantity": 0,
+            "confidence": 50,
+            "reason": "매수 조건 미충족. 20일선 위 + 거래량 급증 종목 없음. 관망.",
+        }
+
     @staticmethod
     def _build_prompt(
         market_data: dict[str, Any],
@@ -120,7 +191,9 @@ class LLMJudge:
                 f"MA20={data.get('ma20')}, "
                 f"거래량={data.get('volume')}, "
                 f"평균거래량={data.get('avg_volume_20')}, "
+                f"거래량비율={data.get('volume_ratio')}, "
                 f"52주고점={data.get('week52_high')}, "
+                f"고점대비={data.get('pct_from_high')}%, "
                 f"MA20상위={data.get('above_ma20')}, "
                 f"거래량급증={data.get('volume_surge')}"
             )
@@ -130,7 +203,8 @@ class LLMJudge:
             for p in positions:
                 lines.append(
                     f"- {p['symbol']}: {p['quantity']}주 @ {p['avg_price']}원 "
-                    f"(현재 {p.get('pnl_pct', 0):+.1f}%)"
+                    f"(현재 {p.get('pnl_pct', 0):+.1f}%, "
+                    f"손절가={p.get('stop_price', 0)}, 목표가={p.get('target_price', 0)})"
                 )
         else:
             lines.append("- 없음")

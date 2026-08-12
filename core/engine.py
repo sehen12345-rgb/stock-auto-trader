@@ -11,6 +11,12 @@ from database.db import get_db
 from database.models import PositionRepository, TradeRepository
 
 DEMO_MODE: bool = os.getenv("DEMO_MODE", "false").lower() == "true"
+SEED_AMOUNT: int = 10_000_000  # 시드 1000만원
+MAX_SLOTS: int = 4
+MAX_PER_SLOT: int = 2_500_000  # 종목당 250만원
+STOP_LOSS_PCT: float = 3.5
+TAKE_PROFIT_PCT: float = 6.0
+MAX_DAILY_LOSS: int = 300_000  # 일 손실 한도 30만원
 
 
 class TradingEngine:
@@ -33,13 +39,17 @@ class TradingEngine:
         self._started_at: datetime | None = None
         self.last_tick: datetime | None = None
         self.llm_call_count = 0
+        self._market_open_notified = False
+        self._market_close_notified = False
+        self._daily_loss: float = 0.0
+        self._daily_loss_date: str = ""
 
         self._decisions: list[dict[str, Any]] = []
         self._watchlist: dict[str, str] = {}
         self._task: asyncio.Task | None = None
 
         if DEMO_MODE:
-            logger.info("[Engine] DEMO_MODE 활성화 — 실제 API 없이 동작합니다")
+            logger.info("[Engine] DEMO_MODE 활성화")
             from core.demo_data import get_demo_watchlist
             for item in get_demo_watchlist():
                 self._watchlist[item["ticker"]] = item["name"]
@@ -61,7 +71,6 @@ class TradingEngine:
         self._started_at = datetime.now()
         self._task = asyncio.create_task(self._loop())
         logger.info("[Engine] 봇 시작")
-
         from notifications.telegram_bot import notify_start
         asyncio.create_task(_safe(notify_start()))
 
@@ -71,15 +80,31 @@ class TradingEngine:
             self._task.cancel()
             self._task = None
         logger.info("[Engine] 봇 중지")
-
         from notifications.telegram_bot import notify_stop
         asyncio.create_task(_safe(notify_stop()))
 
     async def _loop(self) -> None:
         while self.running:
             try:
-                if DEMO_MODE or self._is_market_hours():
+                now = datetime.now()
+                in_market = self._is_market_hours()
+
+                if DEMO_MODE or in_market:
                     await self._tick()
+
+                # 장 시작 알림 (09:00 직후 첫 틱)
+                if not DEMO_MODE and in_market and not self._market_open_notified:
+                    self._market_open_notified = True
+                    self._market_close_notified = False
+                    asyncio.create_task(_safe(self._notify_market_open()))
+
+                # 장 마감 알림 (15:30 이후)
+                if not DEMO_MODE and not in_market and self._market_open_notified and not self._market_close_notified:
+                    if now.time() >= dtime(15, 30):
+                        self._market_close_notified = True
+                        self._market_open_notified = False
+                        asyncio.create_task(_safe(self._notify_market_close()))
+
                 await asyncio.sleep(30)
             except asyncio.CancelledError:
                 break
@@ -90,6 +115,16 @@ class TradingEngine:
     def _is_market_hours(self) -> bool:
         now = datetime.now().time()
         return dtime(9, 0) <= now <= dtime(15, 30)
+
+    def _reset_daily_loss_if_needed(self) -> None:
+        today = datetime.now().strftime("%Y-%m-%d")
+        if today != self._daily_loss_date:
+            self._daily_loss = 0.0
+            self._daily_loss_date = today
+
+    def _is_daily_loss_exceeded(self) -> bool:
+        self._reset_daily_loss_if_needed()
+        return self._daily_loss <= -MAX_DAILY_LOSS
 
     async def _tick(self) -> None:
         self.last_tick = datetime.now()
@@ -112,6 +147,11 @@ class TradingEngine:
 
         positions = await self.get_positions()
 
+        # 손절/익절 자동 체크 (장 중)
+        if not DEMO_MODE and self._is_market_hours():
+            await self._check_stop_conditions(positions, market_data)
+            positions = await self.get_positions()
+
         try:
             decision = await self.judge.judge(
                 market_data=market_data,
@@ -126,18 +166,160 @@ class TradingEngine:
             await broadcast({"type": "decision", "data": decision})
 
             if decision.get("decision") in ("BUY", "SELL"):
-                await self._execute(decision)
+                await self._execute(decision, positions, market_data)
         except Exception as e:
             logger.error(f"[Engine] LLM 판단 에러: {e}")
 
-    async def _execute(self, decision: dict[str, Any]) -> None:
+    async def _check_stop_conditions(
+        self,
+        positions: list[dict[str, Any]],
+        market_data: dict[str, Any],
+    ) -> None:
+        for p in positions:
+            sym = p.get("symbol", "")
+            current = market_data.get(sym, {}).get("current_price", 0) or p.get("current_price", 0)
+            stop = p.get("stop_price", 0)
+            target = p.get("target_price", 0)
+            qty = p.get("quantity", 0)
+
+            if current <= 0 or qty <= 0:
+                continue
+
+            reason = ""
+            if stop > 0 and current <= stop:
+                reason = f"손절가 도달 ({current:,.0f} <= {stop:,.0f})"
+            elif target > 0 and current >= target:
+                reason = f"익절가 도달 ({current:,.0f} >= {target:,.0f})"
+
+            if reason:
+                logger.info(f"[Engine] {sym} {reason} → 자동 매도")
+                await self._execute(
+                    {"decision": "SELL", "ticker": sym, "quantity": qty,
+                     "confidence": 95, "reason": reason},
+                    positions,
+                    market_data,
+                )
+
+    async def _execute(
+        self,
+        decision: dict[str, Any],
+        positions: list[dict[str, Any]],
+        market_data: dict[str, Any],
+    ) -> None:
         ticker = decision.get("ticker", "")
         action = decision.get("decision", "")
-        qty = int(decision.get("quantity", 1))
-        logger.info(f"[Engine] {action} {ticker} x{qty}")
+        reason = decision.get("reason", "")
 
-        from notifications.telegram_bot import notify_trade
-        asyncio.create_task(_safe(notify_trade(action, ticker, qty, decision.get("reason", ""))))
+        if not ticker or not action:
+            return
+
+        if DEMO_MODE:
+            logger.info(f"[Engine][DEMO] {action} {ticker}")
+            from notifications.telegram_bot import notify_trade
+            asyncio.create_task(_safe(notify_trade(action, ticker, decision.get("quantity", 0),
+                                                   0, 0, 0, reason)))
+            return
+
+        if self._is_daily_loss_exceeded():
+            logger.warning(f"[Engine] 일 손실 한도 초과, 주문 차단: {ticker}")
+            return
+
+        held_symbols = [p.get("symbol") for p in positions]
+        current_price = market_data.get(ticker, {}).get("current_price", 0)
+
+        if action == "BUY":
+            if ticker in held_symbols:
+                logger.info(f"[Engine] 이미 보유 중: {ticker}")
+                return
+            if len(held_symbols) >= MAX_SLOTS:
+                logger.warning(f"[Engine] 슬롯 한도 초과 ({MAX_SLOTS}종목)")
+                return
+            if current_price <= 0:
+                logger.warning(f"[Engine] {ticker} 현재가 없음, 매수 건너뜀")
+                return
+
+            qty = max(1, int(MAX_PER_SLOT // current_price))
+            stop_price = round(current_price * (1 - STOP_LOSS_PCT / 100), 0)
+            target_price = round(current_price * (1 + TAKE_PROFIT_PCT / 100), 0)
+
+            try:
+                from core.broker.kis import KISBroker
+                broker = KISBroker()
+                broker.connect()
+                order = broker.buy_market(ticker, qty)
+                logger.info(f"[Engine] 매수 주문: {ticker} {qty}주 @ {current_price:,.0f}원")
+
+                from database.models import PositionRecord
+                self.position_repo.upsert(PositionRecord(
+                    symbol=ticker,
+                    quantity=qty,
+                    avg_price=current_price,
+                    stop_price=stop_price,
+                    target_price=target_price,
+                    market="KOSPI",
+                    strategy="orlando_kim",
+                ))
+
+                from database.models import Trade
+                self.trade_repo.save(Trade(
+                    symbol=ticker,
+                    side="BUY",
+                    order_type="MARKET",
+                    quantity=qty,
+                    price=current_price,
+                    status="FILLED",
+                    market="KOSPI",
+                    strategy="orlando_kim",
+                ))
+
+                from notifications.telegram_bot import notify_trade
+                asyncio.create_task(_safe(notify_trade(
+                    "BUY", ticker, qty, current_price, stop_price, target_price, reason
+                )))
+            except Exception as e:
+                logger.error(f"[Engine] 매수 실패 {ticker}: {e}")
+
+        elif action == "SELL":
+            pos = next((p for p in positions if p.get("symbol") == ticker), None)
+            if pos is None:
+                logger.warning(f"[Engine] 미보유 종목 SELL 시도: {ticker}")
+                return
+
+            qty = pos.get("quantity", 0)
+            avg_price = pos.get("avg_price", 0)
+
+            try:
+                from core.broker.kis import KISBroker
+                broker = KISBroker()
+                broker.connect()
+                order = broker.sell_market(ticker, qty)
+                logger.info(f"[Engine] 매도 주문: {ticker} {qty}주 @ {current_price:,.0f}원")
+
+                pnl = (current_price - avg_price) * qty if current_price > 0 and avg_price > 0 else 0
+                pnl_pct = round((current_price - avg_price) / avg_price * 100, 2) if avg_price > 0 else 0
+                self._daily_loss += pnl
+
+                self.position_repo.delete(ticker)
+
+                from database.models import Trade
+                self.trade_repo.save(Trade(
+                    symbol=ticker,
+                    side="SELL",
+                    order_type="MARKET",
+                    quantity=qty,
+                    price=current_price,
+                    status="FILLED",
+                    market="KOSPI",
+                    strategy="orlando_kim",
+                    pnl=pnl,
+                ))
+
+                from notifications.telegram_bot import notify_trade
+                asyncio.create_task(_safe(notify_trade(
+                    "SELL", ticker, qty, current_price, 0, 0, reason, pnl_pct=pnl_pct
+                )))
+            except Exception as e:
+                logger.error(f"[Engine] 매도 실패 {ticker}: {e}")
 
     async def get_portfolio(self) -> dict[str, Any]:
         if DEMO_MODE:
@@ -148,12 +330,21 @@ class TradingEngine:
             return data
         except Exception as e:
             logger.error(f"[Engine] 포트폴리오 조회 실패: {e}")
-            return {"total_value": 0, "cash": 0, "return_pct": 0.0}
+            return {"total_value": 0, "cash": 0, "return_pct": 0.0, "seed": SEED_AMOUNT}
 
     async def get_positions(self) -> list[dict[str, Any]]:
         if DEMO_MODE:
             from core.demo_data import get_demo_positions
             return get_demo_positions()
+
+        # KIS 잔고 우선, 500 오류 시 DB 폴백
+        try:
+            kis_positions = await self.fetcher.fetch_kis_positions()
+            if kis_positions:
+                return kis_positions
+        except Exception as e:
+            logger.warning(f"[Engine] KIS 포지션 조회 실패, DB 폴백: {e}")
+
         try:
             records = self.position_repo.find_all()
             result = []
@@ -199,6 +390,8 @@ class TradingEngine:
                     data = await self.fetcher.fetch(ticker)
                 item["current_price"] = data.get("current_price", 0)
                 item["week52_high"] = data.get("week52_high", 0)
+                item["volume_ratio"] = data.get("volume_ratio", 0)
+                item["above_ma20"] = data.get("above_ma20", False)
                 high = data.get("week52_high", 0)
                 cur = data.get("current_price", 0)
                 if high > 0 and cur > 0:
@@ -209,15 +402,15 @@ class TradingEngine:
                 item["current_price"] = None
                 item["week52_high"] = None
                 item["pct_from_high"] = None
+                item["volume_ratio"] = None
+                item["above_ma20"] = None
             result.append(item)
         return result
 
     async def get_return_history(self) -> list[dict[str, Any]]:
-        """30일 수익률 추이. 데모 모드에서는 샘플 데이터 반환."""
         if DEMO_MODE:
             from core.demo_data import get_demo_return_history
             return get_demo_return_history(30)
-        # 실전: DB에서 집계 (현재는 빈 배열)
         return []
 
     def add_to_watchlist(self, ticker: str, name: str = "") -> None:
@@ -225,6 +418,17 @@ class TradingEngine:
 
     def remove_from_watchlist(self, ticker: str) -> None:
         self._watchlist.pop(ticker, None)
+
+    async def _notify_market_open(self) -> None:
+        from notifications.telegram_bot import notify_market_open
+        positions = await self.get_positions()
+        await notify_market_open(positions)
+
+    async def _notify_market_close(self) -> None:
+        from notifications.telegram_bot import notify_market_close
+        portfolio = await self.get_portfolio()
+        positions = await self.get_positions()
+        await notify_market_close(portfolio, positions, self._daily_loss)
 
 
 async def _safe(coro: Any) -> None:

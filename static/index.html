@@ -219,6 +219,37 @@
   /* ── OCO 뱃지 ── */
   .oco { display: inline-block; padding: 1px 6px; border-radius: 4px; font-size: 0.68rem; font-weight: 700; background: rgba(76,201,240,0.15); color: var(--blue); }
 
+  /* ── 장 마감 뱃지 ── */
+  .market-closed-badge {
+    display: inline-flex; align-items: center; gap: 4px;
+    padding: 2px 9px; border-radius: 20px; font-size: 0.72rem; font-weight: 700;
+    background: rgba(136,136,170,0.12); color: var(--muted); border: 1px solid var(--border);
+  }
+
+  /* ── 모달 ── */
+  .modal-overlay {
+    display: none; position: fixed; inset: 0; z-index: 999;
+    background: rgba(0,0,0,0.7); align-items: center; justify-content: center;
+  }
+  .modal-overlay.show { display: flex; }
+  .modal-box {
+    background: var(--surface); border: 1px solid var(--border);
+    border-radius: var(--radius); padding: 24px; max-width: 540px; width: 90%;
+    max-height: 80vh; overflow-y: auto;
+  }
+  .modal-title { font-size: 0.85rem; font-weight: 700; margin-bottom: 12px; }
+  .modal-body { font-size: 0.82rem; color: var(--muted); line-height: 1.7; white-space: pre-wrap; }
+  .modal-close { float: right; background: none; border: none; color: var(--muted); cursor: pointer; font-size: 1.2rem; line-height: 1; }
+  .btn-reason { background: none; border: none; color: var(--blue); cursor: pointer; font-size: 0.72rem; text-decoration: underline; padding: 0; margin-left: 6px; }
+
+  /* ── 관심종목 MA 표시 ── */
+  .wl-ma-badge {
+    display: inline-block; padding: 1px 5px; border-radius: 4px; font-size: 0.65rem; font-weight: 700;
+    margin-top: 3px;
+  }
+  .wl-ma-above { background: rgba(0,200,150,0.15); color: var(--green); }
+  .wl-ma-below { background: rgba(255,71,87,0.12); color: var(--red); }
+
   /* ── 반응형 헤더 ── */
   @media (max-width: 640px) {
     .header { padding: 0 14px; }
@@ -245,11 +276,21 @@
     </div>
   </div>
   <div class="header-right">
+    <span id="market-badge"></span>
     <span class="badge" id="mode-badge">-</span>
     <span class="badge" id="run-badge">-</span>
     <button class="btn btn-kill" id="ctrl-btn" onclick="toggleBot()">킬스위치</button>
   </div>
 </header>
+
+<!-- LLM 근거 전체 보기 모달 -->
+<div class="modal-overlay" id="reason-modal" onclick="closeModal(event)">
+  <div class="modal-box">
+    <button class="modal-close" onclick="$('reason-modal').classList.remove('show')">✕</button>
+    <div class="modal-title">LLM 판단 근거</div>
+    <div class="modal-body" id="reason-modal-body"></div>
+  </div>
+</div>
 
 <!-- ══════════════ 본문 ══════════════ -->
 <div class="container">
@@ -429,6 +470,14 @@ async function refreshStatus() {
 
     $('card-llm').textContent = s.llm_call_count;
     $('updated-time').textContent = new Date().toLocaleTimeString('ko-KR');
+
+    // 장 시간 배지
+    const mb2 = $('market-badge');
+    if (s.market_open) {
+      mb2.innerHTML = '';
+    } else {
+      mb2.innerHTML = '<span class="market-closed-badge">⏸ 장 마감</span>';
+    }
   } catch(e) { addLog('status 조회 실패: ' + e.message, 'err'); }
 }
 
@@ -576,11 +625,13 @@ async function refreshDecisions() {
       wrap.innerHTML = '<div class="empty">판단 내역 없음</div>';
       return;
     }
-    wrap.innerHTML = decs.slice(0, 10).map(d => {
+    wrap.innerHTML = decs.slice(0, 10).map((d, i) => {
       const dec = (d.decision || 'HOLD').toUpperCase();
       const cls = dec === 'BUY' ? 'db-buy' : dec === 'SELL' ? 'db-sell' : 'db-hold';
       const conf = d.confidence ?? 0;
       const confColor = conf >= 70 ? 'var(--green)' : conf >= 50 ? 'var(--yellow)' : 'var(--muted)';
+      const reason = d.reason || '-';
+      const shortReason = reason.length > 60 ? reason.slice(0, 60) + '…' : reason;
       return `
         <div class="llm-item">
           <div class="llm-top">
@@ -588,9 +639,10 @@ async function refreshDecisions() {
             <span class="db ${cls}">${dec}</span>
             ${d.ticker ? `<span class="llm-ticker">${d.ticker}</span>` : ''}
             <span style="font-size:.72rem;color:var(--muted)">확신도 ${conf}%</span>
+            ${reason.length > 60 ? `<button class="btn-reason" onclick="showReason(${i})">전체 보기</button>` : ''}
           </div>
           <div class="conf-bar"><div class="conf-fill" style="width:${conf}%;background:${confColor}"></div></div>
-          <div class="llm-reason" style="margin-top:6px">${d.reason || '-'}</div>
+          <div class="llm-reason" style="margin-top:6px">${shortReason}</div>
         </div>`;
     }).join('');
   } catch(e) { addLog('판단 내역 조회 실패: ' + e.message, 'err'); }
@@ -612,13 +664,20 @@ async function refreshWatchlist() {
         ? `고점까지 -${item.pct_from_high.toFixed(1)}%`
         : '';
       const distCls = item.pct_from_high != null && item.pct_from_high < 5 ? 'pos' : 'neutral';
+      const maBadge = item.above_ma20 != null
+        ? `<span class="wl-ma-badge ${item.above_ma20 ? 'wl-ma-above' : 'wl-ma-below'}">${item.above_ma20 ? 'MA20↑' : 'MA20↓'}</span>`
+        : '';
+      const volText = item.volume_ratio != null
+        ? `<div class="wl-dist neutral">거래량 ${item.volume_ratio.toFixed(1)}배</div>`
+        : '';
       return `
         <div class="wl-card">
           <button class="btn-del wl-del" onclick="delWatchlist('${item.ticker}')">✕</button>
-          <div class="wl-ticker">${item.ticker}</div>
+          <div class="wl-ticker">${item.ticker} ${maBadge}</div>
           <div class="wl-name">${item.name || ''}</div>
-          <div class="wl-price">${item.current_price != null ? fmt(item.current_price) : '-'}</div>
+          <div class="wl-price">${item.current_price != null ? fmt(item.current_price) + '원' : '-'}</div>
           ${distText ? `<div class="wl-dist ${distCls}">${distText}</div>` : ''}
+          ${volText}
         </div>`;
     }).join('');
   } catch(e) { addLog('관심종목 조회 실패: ' + e.message, 'err'); }
@@ -729,6 +788,34 @@ setInterval(refreshChart, 300000);
 // 키보드
 $('wl-ticker').addEventListener('keydown', e => { if (e.key === 'Enter') addWatchlist(); });
 $('wl-name').addEventListener('keydown',   e => { if (e.key === 'Enter') addWatchlist(); });
+
+/* ════════════════════════════════════════
+   LLM 근거 모달
+════════════════════════════════════════ */
+let _lastDecisions = [];
+
+async function showReason(idx) {
+  if (!_lastDecisions.length) {
+    try { _lastDecisions = await api('/api/decisions'); } catch(_) {}
+  }
+  const d = _lastDecisions[idx];
+  if (!d) return;
+  const dec = (d.decision || 'HOLD').toUpperCase();
+  $('reason-modal-body').textContent =
+    `[${ts(d.timestamp)}] ${dec} ${d.ticker || ''}\n확신도: ${d.confidence ?? 0}%\n\n${d.reason || '-'}`;
+  $('reason-modal').classList.add('show');
+}
+
+function closeModal(e) {
+  if (e.target === $('reason-modal')) $('reason-modal').classList.remove('show');
+}
+
+// decisions 갱신 시 캐시 갱신
+const _origRefreshDecisions = refreshDecisions;
+refreshDecisions = async function() {
+  await _origRefreshDecisions();
+  try { _lastDecisions = await api('/api/decisions'); } catch(_) {}
+};
 </script>
 </body>
 </html>
