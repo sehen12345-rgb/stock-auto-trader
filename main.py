@@ -1,18 +1,25 @@
-import sys
-from PyQt6.QtWidgets import QApplication
-from gui.main_window import MainWindow
+import uvicorn
+from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.staticfiles import StaticFiles
 
+from api.routes import router
+from api.websocket import ws_router
 
-def main():
-    app = QApplication(sys.argv)
-    app.setApplicationName("주식 자동매매 시스템")
-    app.setOrganizationName("StockAutoTrader")
+app = FastAPI(title="Stock Auto Trader", version="2.0.0")
 
-    window = MainWindow()
-    window.show()
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
-    sys.exit(app.exec())
+app.include_router(router, prefix="/api")
+app.include_router(ws_router)
+app.mount("/", StaticFiles(directory="static", html=True), name="static")
 
 
 if __name__ == "__main__":
-    main()
+    uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=False)

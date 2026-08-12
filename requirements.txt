@@ -1,6 +1,10 @@
-# GUI
-PyQt6==6.7.1
-PyQtGraph==0.13.7
+# Web Backend
+fastapi==0.115.0
+uvicorn[standard]==0.30.6
+websockets==13.0
+
+# LLM
+anthropic==0.34.2
 
 # Data
 pandas==2.2.2
@@ -15,17 +19,11 @@ websocket-client==1.8.0
 # Database
 # SQLite3 is built-in
 
-# Broker (optional: alpaca SDK 대신 requests로 직접 구현됨)
-# alpaca-trade-api==3.3.0  # 필요 시 활성화
-
 # Scheduler
 APScheduler==3.10.4
 
 # Notifications
 python-telegram-bot==21.5
-
-# Packaging
-PyInstaller==6.10.0
 
 # Utils
 python-dotenv==1.0.1

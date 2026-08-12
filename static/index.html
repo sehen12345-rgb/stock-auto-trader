@@ -1,0 +1,510 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Stock Auto Trader</title>
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
+<style>
+  :root {
+    --bg: #1E1E2E;
+    --surface: #2A2A3E;
+    --surface2: #313147;
+    --accent: #7C3AED;
+    --accent2: #6D28D9;
+    --green: #10B981;
+    --red: #EF4444;
+    --yellow: #F59E0B;
+    --text: #E2E8F0;
+    --muted: #94A3B8;
+    --border: #3B3B52;
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { background: var(--bg); color: var(--text); font-family: 'Segoe UI', system-ui, sans-serif; min-height: 100vh; }
+
+  .header {
+    background: var(--surface);
+    border-bottom: 1px solid var(--border);
+    padding: 16px 24px;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    flex-wrap: wrap;
+    gap: 12px;
+  }
+  .header-left { display: flex; align-items: center; gap: 16px; }
+  .logo { font-size: 1.4rem; font-weight: 700; color: var(--text); }
+  .logo span { color: var(--accent); }
+  .updated { font-size: 0.75rem; color: var(--muted); }
+  .header-right { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; }
+
+  .badge {
+    display: inline-flex; align-items: center; gap: 6px;
+    padding: 4px 12px; border-radius: 20px; font-size: 0.8rem; font-weight: 600;
+  }
+  .badge-live { background: rgba(239,68,68,0.2); color: var(--red); border: 1px solid var(--red); }
+  .badge-paper { background: rgba(245,158,11,0.2); color: var(--yellow); border: 1px solid var(--yellow); }
+  .badge-running { background: rgba(16,185,129,0.2); color: var(--green); border: 1px solid var(--green); }
+  .badge-stopped { background: rgba(148,163,184,0.15); color: var(--muted); border: 1px solid var(--border); }
+  .dot { width: 8px; height: 8px; border-radius: 50%; background: currentColor; }
+  .dot.pulse { animation: pulse 1.5s infinite; }
+  @keyframes pulse { 0%,100%{opacity:1} 50%{opacity:0.4} }
+
+  .btn-kill {
+    background: var(--red); color: #fff; border: none; padding: 6px 16px;
+    border-radius: 8px; font-size: 0.85rem; font-weight: 600; cursor: pointer;
+    transition: opacity 0.2s;
+  }
+  .btn-kill:hover { opacity: 0.85; }
+  .btn-start {
+    background: var(--green); color: #fff; border: none; padding: 6px 16px;
+    border-radius: 8px; font-size: 0.85rem; font-weight: 600; cursor: pointer;
+    transition: opacity 0.2s;
+  }
+  .btn-start:hover { opacity: 0.85; }
+
+  .container { max-width: 1400px; margin: 0 auto; padding: 24px; }
+
+  .returns-bar {
+    display: flex; gap: 16px; flex-wrap: wrap; margin-bottom: 24px;
+  }
+  .return-chip {
+    background: var(--surface); border: 1px solid var(--border);
+    border-radius: 10px; padding: 10px 18px; display: flex; flex-direction: column; gap: 2px;
+  }
+  .return-chip .label { font-size: 0.7rem; color: var(--muted); text-transform: uppercase; letter-spacing: 0.05em; }
+  .return-chip .value { font-size: 1.1rem; font-weight: 700; }
+  .pos { color: var(--green); }
+  .neg { color: var(--red); }
+  .neutral { color: var(--text); }
+
+  .cards {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+    gap: 16px;
+    margin-bottom: 24px;
+  }
+  .card {
+    background: var(--surface); border: 1px solid var(--border);
+    border-radius: 12px; padding: 20px;
+  }
+  .card-label { font-size: 0.75rem; color: var(--muted); margin-bottom: 8px; text-transform: uppercase; letter-spacing: 0.05em; }
+  .card-value { font-size: 1.6rem; font-weight: 700; }
+  .card-sub { font-size: 0.75rem; color: var(--muted); margin-top: 4px; }
+
+  .grid-2 { display: grid; grid-template-columns: 1fr 1fr; gap: 24px; margin-bottom: 24px; }
+  @media (max-width: 900px) { .grid-2 { grid-template-columns: 1fr; } }
+
+  .panel {
+    background: var(--surface); border: 1px solid var(--border);
+    border-radius: 12px; padding: 20px;
+  }
+  .panel-title { font-size: 0.9rem; font-weight: 600; color: var(--muted); margin-bottom: 16px; text-transform: uppercase; letter-spacing: 0.05em; }
+
+  .chart-wrap { height: 220px; position: relative; }
+
+  table { width: 100%; border-collapse: collapse; font-size: 0.85rem; }
+  th { text-align: left; padding: 8px 10px; color: var(--muted); font-size: 0.75rem; text-transform: uppercase; letter-spacing: 0.04em; border-bottom: 1px solid var(--border); }
+  td { padding: 10px; border-bottom: 1px solid rgba(255,255,255,0.04); }
+  tr:last-child td { border-bottom: none; }
+  tr:hover td { background: rgba(255,255,255,0.02); }
+
+  .decision-badge {
+    display: inline-block; padding: 2px 8px; border-radius: 6px;
+    font-size: 0.75rem; font-weight: 700;
+  }
+  .buy { background: rgba(16,185,129,0.2); color: var(--green); }
+  .sell { background: rgba(239,68,68,0.2); color: var(--red); }
+  .hold { background: rgba(148,163,184,0.15); color: var(--muted); }
+
+  .watchlist-grid {
+    display: grid; grid-template-columns: repeat(auto-fill, minmax(180px, 1fr)); gap: 12px;
+  }
+  .watchlist-item {
+    background: var(--surface2); border: 1px solid var(--border);
+    border-radius: 10px; padding: 14px;
+  }
+  .watchlist-ticker { font-size: 0.85rem; font-weight: 700; margin-bottom: 4px; }
+  .watchlist-name { font-size: 0.7rem; color: var(--muted); margin-bottom: 8px; }
+  .watchlist-price { font-size: 1rem; font-weight: 600; }
+  .watchlist-dist { font-size: 0.75rem; margin-top: 4px; }
+  .watchlist-add { display: flex; gap: 8px; margin-bottom: 16px; flex-wrap: wrap; }
+  .watchlist-add input {
+    background: var(--surface2); border: 1px solid var(--border);
+    color: var(--text); border-radius: 8px; padding: 8px 12px; font-size: 0.85rem; flex: 1; min-width: 100px;
+  }
+  .watchlist-add input:focus { outline: none; border-color: var(--accent); }
+  .btn-add {
+    background: var(--accent); color: #fff; border: none; padding: 8px 16px;
+    border-radius: 8px; font-size: 0.85rem; font-weight: 600; cursor: pointer;
+  }
+  .btn-del {
+    background: none; border: none; color: var(--muted); cursor: pointer; font-size: 0.8rem; float: right;
+  }
+  .btn-del:hover { color: var(--red); }
+
+  .empty { text-align: center; color: var(--muted); padding: 32px; font-size: 0.85rem; }
+
+  .ws-status {
+    display: inline-flex; align-items: center; gap: 6px;
+    font-size: 0.75rem; color: var(--muted);
+  }
+  .ws-dot { width: 6px; height: 6px; border-radius: 50%; background: var(--muted); }
+  .ws-dot.connected { background: var(--green); }
+
+  @media (max-width: 640px) {
+    .header { padding: 12px 16px; }
+    .container { padding: 16px; }
+    .card-value { font-size: 1.3rem; }
+  }
+</style>
+</head>
+<body>
+
+<header class="header">
+  <div class="header-left">
+    <div class="logo">Stock<span>AI</span></div>
+    <div class="updated">갱신: <span id="updated-time">-</span></div>
+    <span class="ws-status"><span class="ws-dot" id="ws-dot"></span><span id="ws-label">연결중</span></span>
+  </div>
+  <div class="header-right">
+    <span class="badge" id="mode-badge">-</span>
+    <span class="badge" id="run-badge">-</span>
+    <button class="btn-kill" id="kill-btn" onclick="toggleBot()">킬스위치</button>
+  </div>
+</header>
+
+<div class="container">
+  <div class="returns-bar">
+    <div class="return-chip">
+      <div class="label">국장 수익률</div>
+      <div class="value" id="kr-return">-</div>
+    </div>
+    <div class="return-chip">
+      <div class="label">총평가액</div>
+      <div class="value" id="total-value">-</div>
+    </div>
+    <div class="return-chip">
+      <div class="label">현금</div>
+      <div class="value neutral" id="cash-value">-</div>
+    </div>
+  </div>
+
+  <div class="cards">
+    <div class="card">
+      <div class="card-label">총평가액</div>
+      <div class="card-value" id="card-total">-</div>
+      <div class="card-sub">KRW</div>
+    </div>
+    <div class="card">
+      <div class="card-label">현금</div>
+      <div class="card-value" id="card-cash">-</div>
+      <div class="card-sub">예수금</div>
+    </div>
+    <div class="card">
+      <div class="card-label">보유종목</div>
+      <div class="card-value" id="card-positions">0 / 4</div>
+      <div class="card-sub">최대 4종목</div>
+    </div>
+    <div class="card">
+      <div class="card-label">LLM 호출</div>
+      <div class="card-value" id="card-llm">0</div>
+      <div class="card-sub">오늘 총 판단 횟수</div>
+    </div>
+  </div>
+
+  <div class="grid-2">
+    <div class="panel">
+      <div class="panel-title">수익률 추이</div>
+      <div class="chart-wrap">
+        <canvas id="returnChart"></canvas>
+      </div>
+    </div>
+    <div class="panel">
+      <div class="panel-title">현재 포지션</div>
+      <div id="positions-wrap">
+        <div class="empty">포지션 없음</div>
+      </div>
+    </div>
+  </div>
+
+  <div class="panel" style="margin-bottom:24px">
+    <div class="panel-title">LLM 판단 내역</div>
+    <div id="decisions-wrap">
+      <div class="empty">판단 내역 없음</div>
+    </div>
+  </div>
+
+  <div class="panel">
+    <div class="panel-title">관심종목</div>
+    <div class="watchlist-add">
+      <input id="wl-ticker" placeholder="종목코드 (예: 005930)" maxlength="10">
+      <input id="wl-name" placeholder="종목명" maxlength="20">
+      <button class="btn-add" onclick="addWatchlist()">추가</button>
+    </div>
+    <div class="watchlist-grid" id="watchlist-grid">
+      <div class="empty">관심종목 없음</div>
+    </div>
+  </div>
+</div>
+
+<script>
+const API = '';
+let botRunning = false;
+let returnData = { labels: [], values: [] };
+let returnChart;
+
+async function api(path, method = 'GET', body = null) {
+  const opts = { method, headers: { 'Content-Type': 'application/json' } };
+  if (body) opts.body = JSON.stringify(body);
+  const r = await fetch(API + path, opts);
+  if (!r.ok) throw new Error(await r.text());
+  return r.json();
+}
+
+function fmt(n) {
+  if (n === null || n === undefined) return '-';
+  return Number(n).toLocaleString('ko-KR');
+}
+function fmtPct(n) {
+  if (n === null || n === undefined) return '-';
+  const v = parseFloat(n);
+  return (v >= 0 ? '+' : '') + v.toFixed(2) + '%';
+}
+function pctClass(n) {
+  if (!n && n !== 0) return 'neutral';
+  return parseFloat(n) >= 0 ? 'pos' : 'neg';
+}
+
+async function refreshStatus() {
+  try {
+    const s = await api('/api/status');
+    botRunning = s.running;
+    const modeBadge = document.getElementById('mode-badge');
+    modeBadge.textContent = s.mode === 'live' ? '실전' : '모의';
+    modeBadge.className = 'badge ' + (s.mode === 'live' ? 'badge-live' : 'badge-paper');
+
+    const runBadge = document.getElementById('run-badge');
+    runBadge.textContent = s.running ? '가동중' : '중지';
+    runBadge.className = 'badge ' + (s.running ? 'badge-running' : 'badge-stopped');
+    const dot = runBadge.querySelector('.dot');
+
+    const killBtn = document.getElementById('kill-btn');
+    killBtn.textContent = s.running ? '킬스위치' : '시작';
+    killBtn.className = s.running ? 'btn-kill' : 'btn-start';
+
+    document.getElementById('card-llm').textContent = s.llm_call_count;
+    document.getElementById('updated-time').textContent = new Date().toLocaleTimeString('ko-KR');
+  } catch(e) { console.warn('status:', e); }
+}
+
+async function refreshPortfolio() {
+  try {
+    const pf = await api('/api/portfolio');
+    const ret = pf.return_pct;
+    const retStr = fmtPct(ret);
+    document.getElementById('kr-return').textContent = retStr;
+    document.getElementById('kr-return').className = 'value ' + pctClass(ret);
+    document.getElementById('total-value').textContent = fmt(pf.total_value) + '원';
+    document.getElementById('cash-value').textContent = fmt(pf.cash) + '원';
+    document.getElementById('card-total').textContent = fmt(pf.total_value);
+    document.getElementById('card-cash').textContent = fmt(pf.cash);
+
+    const now = new Date().toLocaleTimeString('ko-KR', {hour:'2-digit', minute:'2-digit'});
+    returnData.labels.push(now);
+    returnData.values.push(parseFloat(ret) || 0);
+    if (returnData.labels.length > 20) {
+      returnData.labels.shift(); returnData.values.shift();
+    }
+    returnChart.data.labels = returnData.labels;
+    returnChart.data.datasets[0].data = returnData.values;
+    returnChart.update('none');
+  } catch(e) { console.warn('portfolio:', e); }
+}
+
+async function refreshPositions() {
+  try {
+    const positions = await api('/api/positions');
+    document.getElementById('card-positions').textContent = positions.length + ' / 4';
+    const wrap = document.getElementById('positions-wrap');
+    if (!positions.length) {
+      wrap.innerHTML = '<div class="empty">포지션 없음</div>';
+      return;
+    }
+    wrap.innerHTML = `
+      <table>
+        <thead><tr>
+          <th>종목</th><th>수량</th><th>평단가</th><th>현재가</th><th>수익률</th><th>진입일</th>
+        </tr></thead>
+        <tbody>
+          ${positions.map(p => `
+            <tr>
+              <td><b>${p.symbol}</b></td>
+              <td>${p.quantity}주</td>
+              <td>${fmt(p.avg_price)}</td>
+              <td>${fmt(p.current_price)}</td>
+              <td class="${pctClass(p.pnl_pct)}">${fmtPct(p.pnl_pct)}</td>
+              <td>${p.opened_at ? p.opened_at.slice(0,10) : '-'}</td>
+            </tr>
+          `).join('')}
+        </tbody>
+      </table>`;
+  } catch(e) { console.warn('positions:', e); }
+}
+
+async function refreshDecisions() {
+  try {
+    const decisions = await api('/api/decisions');
+    const wrap = document.getElementById('decisions-wrap');
+    if (!decisions.length) {
+      wrap.innerHTML = '<div class="empty">판단 내역 없음</div>';
+      return;
+    }
+    wrap.innerHTML = `
+      <table>
+        <thead><tr>
+          <th>시각</th><th>결정</th><th>종목</th><th>확신도</th><th>근거</th>
+        </tr></thead>
+        <tbody>
+          ${decisions.map(d => `
+            <tr>
+              <td style="white-space:nowrap">${d.timestamp ? d.timestamp.slice(11,16) : '-'}</td>
+              <td><span class="decision-badge ${(d.decision||'hold').toLowerCase()}">${d.decision || 'HOLD'}</span></td>
+              <td>${d.ticker || '-'}</td>
+              <td>${d.confidence != null ? d.confidence + '%' : '-'}</td>
+              <td style="max-width:300px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="${(d.reason||'').replace(/"/g,'')}">${(d.reason || '-').slice(0, 60)}${(d.reason||'').length > 60 ? '…' : ''}</td>
+            </tr>
+          `).join('')}
+        </tbody>
+      </table>`;
+  } catch(e) { console.warn('decisions:', e); }
+}
+
+async function refreshWatchlist() {
+  try {
+    const items = await api('/api/watchlist');
+    const grid = document.getElementById('watchlist-grid');
+    if (!items.length) {
+      grid.innerHTML = '<div class="empty">관심종목 없음</div>';
+      return;
+    }
+    grid.innerHTML = items.map(item => {
+      const distText = item.pct_from_high != null
+        ? `고점까지 -${item.pct_from_high.toFixed(1)}%`
+        : '';
+      const distClass = item.pct_from_high != null && item.pct_from_high < 10 ? 'pos' : 'neutral';
+      return `
+        <div class="watchlist-item">
+          <button class="btn-del" onclick="delWatchlist('${item.ticker}')">✕</button>
+          <div class="watchlist-ticker">${item.ticker}</div>
+          <div class="watchlist-name">${item.name || ''}</div>
+          <div class="watchlist-price">${item.current_price ? fmt(item.current_price) + '원' : '-'}</div>
+          ${distText ? `<div class="watchlist-dist ${distClass}">${distText}</div>` : ''}
+        </div>`;
+    }).join('');
+  } catch(e) { console.warn('watchlist:', e); }
+}
+
+async function addWatchlist() {
+  const ticker = document.getElementById('wl-ticker').value.trim();
+  const name = document.getElementById('wl-name').value.trim();
+  if (!ticker) return;
+  try {
+    await api('/api/watchlist', 'POST', { ticker, name });
+    document.getElementById('wl-ticker').value = '';
+    document.getElementById('wl-name').value = '';
+    refreshWatchlist();
+  } catch(e) { alert('추가 실패: ' + e.message); }
+}
+
+async function delWatchlist(ticker) {
+  try {
+    await api('/api/watchlist/' + ticker, 'DELETE');
+    refreshWatchlist();
+  } catch(e) { alert('삭제 실패: ' + e.message); }
+}
+
+async function toggleBot() {
+  try {
+    if (botRunning) {
+      await api('/api/stop', 'POST');
+    } else {
+      await api('/api/start', 'POST');
+    }
+    await refreshStatus();
+  } catch(e) { alert('오류: ' + e.message); }
+}
+
+function initChart() {
+  const ctx = document.getElementById('returnChart').getContext('2d');
+  returnChart = new Chart(ctx, {
+    type: 'line',
+    data: {
+      labels: [],
+      datasets: [{
+        label: '수익률(%)',
+        data: [],
+        borderColor: '#7C3AED',
+        backgroundColor: 'rgba(124,58,237,0.15)',
+        borderWidth: 2,
+        pointRadius: 3,
+        fill: true,
+        tension: 0.4,
+      }]
+    },
+    options: {
+      responsive: true,
+      maintainAspectRatio: false,
+      plugins: { legend: { display: false } },
+      scales: {
+        x: { ticks: { color: '#94A3B8', font: { size: 10 } }, grid: { color: '#3B3B52' } },
+        y: { ticks: { color: '#94A3B8', font: { size: 10 } }, grid: { color: '#3B3B52' } }
+      }
+    }
+  });
+}
+
+function initWebSocket() {
+  const proto = location.protocol === 'https:' ? 'wss' : 'ws';
+  const ws = new WebSocket(`${proto}://${location.host}/ws/live`);
+  const dot = document.getElementById('ws-dot');
+  const label = document.getElementById('ws-label');
+
+  ws.onopen = () => {
+    dot.className = 'ws-dot connected';
+    label.textContent = '실시간';
+  };
+  ws.onmessage = (e) => {
+    try {
+      const msg = JSON.parse(e.data);
+      if (msg.type === 'decision') refreshDecisions();
+      if (msg.type === 'position') refreshPositions();
+    } catch(_) {}
+  };
+  ws.onclose = () => {
+    dot.className = 'ws-dot';
+    label.textContent = '재연결중';
+    setTimeout(initWebSocket, 5000);
+  };
+  ws.onerror = () => ws.close();
+}
+
+async function refreshAll() {
+  await refreshStatus();
+  await refreshPortfolio();
+  await refreshPositions();
+  await refreshDecisions();
+  await refreshWatchlist();
+}
+
+initChart();
+initWebSocket();
+refreshAll();
+setInterval(refreshAll, 30000);
+
+document.getElementById('wl-ticker').addEventListener('keydown', e => {
+  if (e.key === 'Enter') addWatchlist();
+});
+</script>
+</body>
+</html>
