@@ -15,6 +15,9 @@ websocket-client==1.8.0
 # Database
 # SQLite3 is built-in
 
+# Broker (optional: alpaca SDK 대신 requests로 직접 구현됨)
+# alpaca-trade-api==3.3.0  # 필요 시 활성화
+
 # Scheduler
 APScheduler==3.10.4
 
