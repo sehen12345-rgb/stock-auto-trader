@@ -9,6 +9,12 @@ KIS_APP_SECRET = os.getenv("KIS_APP_SECRET", "")
 KIS_ACCOUNT_NO = os.getenv("KIS_ACCOUNT_NO", "")
 KIS_MOCK = os.getenv("KIS_MOCK", "true").lower() == "true"
 
+# 토스증권 Open API (KOSPI)
+TOSS_APP_KEY = os.getenv("TOSS_APP_KEY", "")
+TOSS_APP_SECRET = os.getenv("TOSS_APP_SECRET", "")
+TOSS_ACCOUNT_NO = os.getenv("TOSS_ACCOUNT_NO", "")
+TOSS_MOCK = os.getenv("TOSS_MOCK", "true").lower() == "true"
+
 # Alpaca API (NASDAQ)
 ALPACA_API_KEY = os.getenv("ALPACA_API_KEY", "")
 ALPACA_SECRET_KEY = os.getenv("ALPACA_SECRET_KEY", "")
