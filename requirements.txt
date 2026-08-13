@@ -1,4 +1,8 @@
-# Web Backend
+# GUI
+PyQt6>=6.7.0
+PyQtGraph>=0.13.7
+
+# Web Backend (레거시 참고용)
 fastapi==0.115.0
 uvicorn[standard]==0.30.6
 websockets==13.0
