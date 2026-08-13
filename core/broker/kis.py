@@ -1,4 +1,5 @@
-import time
+import json
+import os
 from datetime import datetime, timedelta
 from typing import Any
 
@@ -91,7 +92,37 @@ class KISBroker(BaseBroker):
 
     # ── 토큰 ────────────────────────────────────────────────────────────
 
+    _TOKEN_CACHE = "data/kis_token.json"
+
+    def _load_cached_token(self) -> bool:
+        """파일에 저장된 토큰 로드. 유효하면 True 반환."""
+        try:
+            if not os.path.exists(self._TOKEN_CACHE):
+                return False
+            with open(self._TOKEN_CACHE, "r") as f:
+                cached = json.load(f)
+            expires_at = datetime.fromisoformat(cached["expires_at"])
+            if datetime.now() < expires_at - timedelta(minutes=10):
+                self._access_token = cached["access_token"]
+                self._token_expires_at = expires_at
+                self._session.headers.update({"authorization": f"Bearer {self._access_token}"})
+                logger.debug(f"[KIS] 캐시된 토큰 사용 (만료: {expires_at:%Y-%m-%d %H:%M})")
+                return True
+        except Exception:
+            pass
+        return False
+
+    def _save_token_cache(self) -> None:
+        os.makedirs("data", exist_ok=True)
+        with open(self._TOKEN_CACHE, "w") as f:
+            json.dump({
+                "access_token": self._access_token,
+                "expires_at": self._token_expires_at.isoformat(),
+            }, f)
+
     def _issue_token(self) -> None:
+        if self._load_cached_token():
+            return
         url = f"{self.base_url}/oauth2/tokenP"
         payload = {
             "grant_type": "client_credentials",
@@ -106,11 +137,15 @@ class KISBroker(BaseBroker):
         expires_in = int(data.get("expires_in", 86400))
         self._token_expires_at = datetime.now() + timedelta(seconds=expires_in)
         self._session.headers.update({"authorization": f"Bearer {self._access_token}"})
+        self._save_token_cache()
         logger.debug(f"[KIS] 토큰 발급 완료 (만료: {self._token_expires_at:%Y-%m-%d %H:%M})")
 
     def _ensure_token(self) -> None:
         if datetime.now() >= self._token_expires_at - timedelta(minutes=10):
             logger.info("[KIS] 토큰 갱신 중...")
+            # 캐시 삭제 후 재발급
+            if os.path.exists(self._TOKEN_CACHE):
+                os.remove(self._TOKEN_CACHE)
             self._issue_token()
 
     def _headers(self, tr_id: str, extra: dict | None = None) -> dict:

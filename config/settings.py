@@ -30,6 +30,9 @@ TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
 # Demo Mode (API 키 없이 데모 실행)
 DEMO_MODE = os.getenv("DEMO_MODE", "false").lower() == "true"
 
+# 자금 설정
+SEED_AMOUNT = int(os.getenv("SEED_AMOUNT", "1000000"))
+
 # App
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO")
 DB_PATH = os.getenv("DB_PATH", "data/trading.db")
