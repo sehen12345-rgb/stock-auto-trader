@@ -1,5 +1,6 @@
 import asyncio
 import os
+import time as _time
 from datetime import datetime, time as dtime
 from typing import Any
 
@@ -63,6 +64,13 @@ class TradingEngine:
         self.trading_mode: str = "long_term"
         # 트레일링 스탑: {symbol: 최고가}
         self._trailing_stops: dict[str, float] = {}
+
+        # 시장 필터 캐시
+        self._fear_greed_cache: dict[str, Any] = {}
+        self._fear_greed_ts: float = 0.0
+        self._FEAR_GREED_TTL: float = 300.0  # 5분
+        self._kospi_change: float = 0.0
+        self._nasdaq_change: float = 0.0
 
         # 올랜도킴 기본 관심종목 (우량주 위주)
         _DEFAULT_WATCHLIST: dict[str, str] = {
@@ -163,6 +171,21 @@ class TradingEngine:
         self._reset_daily_loss_if_needed()
         return self._daily_loss <= -MAX_DAILY_LOSS
 
+    def _get_fear_greed_cached(self) -> dict[str, Any]:
+        """Fear & Greed 지수 조회 (5분 캐시)."""
+        now = _time.monotonic()
+        if self._fear_greed_cache and (now - self._fear_greed_ts) < self._FEAR_GREED_TTL:
+            return self._fear_greed_cache
+        try:
+            from core.market_filter import get_fear_greed_index
+            result = get_fear_greed_index()
+            self._fear_greed_cache = result
+            self._fear_greed_ts = now
+            return result
+        except Exception as e:
+            logger.debug(f"[Engine] Fear&Greed 캐시 갱신 실패: {e}")
+            return self._fear_greed_cache or {"value": 50, "rating": "Neutral"}
+
     async def _tick(self) -> None:
         self.last_tick = datetime.now()
         tickers = list(self._watchlist.keys())
@@ -181,6 +204,41 @@ class TradingEngine:
                     market_data[ticker] = data
                 except Exception as e:
                     logger.warning(f"[Engine] {ticker} 시세 조회 실패: {e}")
+
+        # 시장 필터 데이터 조회
+        fear_greed: dict[str, Any] = {"value": 50, "rating": "Neutral"}
+        kospi_change: float = 0.0
+        nasdaq_change: float = 0.0
+        if not DEMO_MODE:
+            try:
+                from core.market_filter import get_fear_greed_index, get_kospi_change, get_nasdaq_change, is_market_bullish
+                fear_greed = self._get_fear_greed_cached()
+                kospi_change = get_kospi_change()
+                nasdaq_change = get_nasdaq_change()
+                self._kospi_change = kospi_change
+                self._nasdaq_change = nasdaq_change
+                bullish = is_market_bullish(kospi_change, fear_greed.get("value", 50))
+                logger.debug(
+                    f"[Engine] 시장필터: 코스피{kospi_change:+.2f}%, "
+                    f"FG={fear_greed.get('value')}({fear_greed.get('rating')}), "
+                    f"매수적합={bullish}"
+                )
+            except Exception as e:
+                logger.debug(f"[Engine] 시장 필터 조회 실패: {e}")
+
+            # 외국인/기관 동향 병합 (국내주식만)
+            try:
+                from core.kis_extra import get_investor_trend
+                from core.broker.kis import KISBroker
+                kis_broker = KISBroker()
+                kis_broker.connect()
+                for ticker in tickers:
+                    if not KISBroker._is_overseas(ticker):
+                        investor = get_investor_trend(ticker, kis_broker)
+                        if ticker in market_data:
+                            market_data[ticker].update(investor)
+            except Exception as e:
+                logger.debug(f"[Engine] 외국인/기관 동향 조회 실패: {e}")
 
         positions = await self.get_positions()
 
@@ -207,6 +265,9 @@ class TradingEngine:
                 positions=positions,
                 watchlist=self._watchlist,
                 trading_mode=self.trading_mode,
+                fear_greed=fear_greed,
+                kospi_change=kospi_change,
+                nasdaq_change=nasdaq_change,
             )
             self.llm_call_count += 1
 

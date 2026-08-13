@@ -61,6 +61,13 @@ class DayTradingStrategy(BaseStrategy):
                 current_price = d.get("current_price", 0.0)
                 ma20 = d.get("ma20", 0.0)
                 bb_lower = d.get("bb_lower")
+                stoch_k = d.get("stoch_k")
+                adx = d.get("adx")
+                hammer = d.get("hammer", False)
+                bullish_engulfing = d.get("bullish_engulfing", False)
+                heavy_resistance = d.get("heavy_resistance", False)
+                double_bottom = d.get("double_bottom", False)
+                foreign_buying = d.get("foreign_buying", False)
 
                 if None in (macd, macd_signal, rsi) or not current_price:
                     continue
@@ -85,6 +92,39 @@ class DayTradingStrategy(BaseStrategy):
                         score += bb_bonus
                         reasons.append(f"볼린저하단 근접({bb_lower:,.0f}) 반등 보너스")
 
+                    # Stochastic %K < 20 → 과매도 보너스
+                    if stoch_k is not None and stoch_k < 20:
+                        score += 8.0
+                        reasons.append(f"Stoch%K={stoch_k:.1f}(과매도)")
+
+                    # ADX > 25 → 추세 강함 보너스
+                    if adx is not None and adx > 25:
+                        score += 6.0
+                        reasons.append(f"ADX={adx:.1f}(추세강함)")
+
+                    # 망치형 or 불리시 장악형 보너스
+                    if hammer:
+                        score += 8.0
+                        reasons.append("망치형캔들")
+                    if bullish_engulfing:
+                        score += 10.0
+                        reasons.append("불리시장악형")
+
+                    # 두꺼운 매물대 페널티
+                    if heavy_resistance:
+                        score -= 12.0
+                        reasons.append("두꺼운매물대(페널티)")
+
+                    # 쌍바닥 보너스
+                    if double_bottom:
+                        score += 15.0
+                        reasons.append("쌍바닥패턴")
+
+                    # 외국인 순매수 보너스
+                    if foreign_buying:
+                        score += 6.0
+                        reasons.append("외국인순매수")
+
                     reason = ". ".join(reasons) + f". 손절-{stop_pct}%/익절+{tp_pct}%"
                     signals.append(
                         Signal(
@@ -100,6 +140,8 @@ class DayTradingStrategy(BaseStrategy):
                                 "macd_signal": macd_signal,
                                 "ma20": ma20,
                                 "bb_lower": bb_lower,
+                                "adx": adx,
+                                "stoch_k": stoch_k,
                                 "stop_pct": stop_pct,
                                 "take_profit_pct": tp_pct,
                             },

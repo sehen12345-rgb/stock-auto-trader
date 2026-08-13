@@ -49,6 +49,29 @@ SYSTEM_PROMPT = """당신은 올랜도킴 매매 전략을 따르는 AI 트레�
 - 익절: +4% ~ +8% 구간에서 단계적 청산
 - 20일선 아래로 하락 시 매도 검토
 
+### 캔들 패턴 신호
+- 망치형(hammer) + RSI 과매도 → 강력 매수 신호
+- 불리시 장악형(bullish_engulfing) → 추세 전환 매수
+- 슈팅스타(shooting_star) + 저항선 근처 → 매도 신호
+- 베어리시 장악형(bearish_engulfing) → 매도 신호
+
+### 매물대 규칙
+- heavy_resistance=True → 위에 두꺼운 매물대, 매수 신중
+- near_support=True + 다른 매수 조건 → 매수 강화
+- 현재가 POC 위(above_poc=True) → 상승 모멘텀
+
+### 외국인/기관 동향
+- foreign_buying=True + institution 순매수 → 매수 신호 강화
+- 외국인 순매도 지속 → 매수 금지
+
+### 공포지수 (Fear & Greed)
+- Fear & Greed < 25 (극단적 공포) → 역발상 매수 기회
+- Fear & Greed > 75 (극단적 탐욕) → 매수 신중
+
+### 추세 강도 (ADX)
+- ADX > 25 → 추세 강함, 추세 방향으로 매매
+- ADX < 20 → 횡보장, 추세 추종 전략 효과 감소
+
 ### 반도체 섹터 특이사항 (올랜도킴 2026-08 시황)
 - SK하이닉스(000660): 20일선 돌파 + 쌍바닥 → 상승 추세 전환 확인
 - 삼성전자(005930): 매물대 소화 중, 완만한 상승 각도 예상
@@ -117,6 +140,9 @@ class LLMJudge:
         positions: list[dict[str, Any]],
         watchlist: dict[str, str],
         trading_mode: str = "long_term",
+        fear_greed: dict[str, Any] | None = None,
+        kospi_change: float = 0.0,
+        nasdaq_change: float = 0.0,
     ) -> dict[str, Any]:
         if self._client is None:
             result = self._rule_based_judge(market_data, positions)
@@ -124,7 +150,10 @@ class LLMJudge:
                         f"확신도:{result.get('confidence')}%")
             return result
 
-        prompt = self._build_prompt(market_data, positions, watchlist, trading_mode)
+        prompt = self._build_prompt(
+            market_data, positions, watchlist, trading_mode,
+            fear_greed=fear_greed, kospi_change=kospi_change, nasdaq_change=nasdaq_change,
+        )
         try:
             response = self._client.messages.create(
                 model="claude-sonnet-4-6",
@@ -254,6 +283,9 @@ class LLMJudge:
         positions: list[dict[str, Any]],
         watchlist: dict[str, str],
         trading_mode: str = "long_term",
+        fear_greed: dict[str, Any] | None = None,
+        kospi_change: float = 0.0,
+        nasdaq_change: float = 0.0,
     ) -> str:
         mode_labels = {
             "scalping": "스캘핑 (손절-1%/익절+1.5%)",
@@ -263,7 +295,21 @@ class LLMJudge:
         }
         mode_label = mode_labels.get(trading_mode, trading_mode)
 
-        lines = [f"## 현재 매매 모드: {mode_label}", "", "## 현재 시세 데이터 (기술 지표 포함)"]
+        lines = [f"## 현재 매매 모드: {mode_label}", ""]
+
+        # 시장 환경 섹션
+        fg_val = (fear_greed or {}).get("value", 50)
+        fg_rating = (fear_greed or {}).get("rating", "Neutral")
+        lines.append("## 시장 환경")
+        lines.append(f"- 코스피 변동률: {kospi_change:+.2f}%")
+        lines.append(f"- 나스닥 변동률: {nasdaq_change:+.2f}%")
+        lines.append(f"- Fear & Greed 지수: {fg_val} ({fg_rating})")
+        lines.append(
+            f"- 시장 매수 적합: {'예' if kospi_change >= -1.5 and fg_val >= 25 else '아니오'}"
+        )
+        lines.append("")
+
+        lines.append("## 현재 시세 데이터 (기술 지표 포함)")
         for ticker, data in market_data.items():
             rsi = data.get("rsi")
             macd = data.get("macd")
@@ -273,6 +319,45 @@ class LLMJudge:
             atr = data.get("atr")
             ema9 = data.get("ema9")
             pullback = data.get("pullback_detected", False)
+            adx = data.get("adx")
+            stoch_k = data.get("stoch_k")
+            stoch_d = data.get("stoch_d")
+            vwap = data.get("vwap")
+
+            # 캔들 패턴
+            candle_signals = []
+            if data.get("hammer"):
+                candle_signals.append("망치형")
+            if data.get("doji"):
+                candle_signals.append("도지")
+            if data.get("bullish_engulfing"):
+                candle_signals.append("불리시장악형")
+            if data.get("bearish_engulfing"):
+                candle_signals.append("베어리시장악형")
+            if data.get("shooting_star"):
+                candle_signals.append("슈팅스타")
+            if data.get("morning_star"):
+                candle_signals.append("모닝스타")
+            candle_str = ",".join(candle_signals) if candle_signals else "없음"
+
+            # 매물대
+            poc = data.get("poc")
+            heavy_res = data.get("heavy_resistance", False)
+            above_poc = data.get("above_poc", False)
+
+            # 지지/저항
+            support = data.get("support")
+            resistance = data.get("resistance")
+            near_support = data.get("near_support", False)
+            near_resistance = data.get("near_resistance", False)
+
+            # 외국인/기관
+            foreign_net = data.get("foreign_net", 0)
+            institution_net = data.get("institution_net", 0)
+            foreign_buying = data.get("foreign_buying", False)
+
+            # 쌍바닥
+            double_bottom = data.get("double_bottom", False)
 
             # MACD 방향
             macd_dir = ""
@@ -290,18 +375,27 @@ class LLMJudge:
                 f"MACD={macd_dir}({round(macd, 4) if macd is not None else 'N/A'}), "
                 f"BB상단={bb_upper}, BB하단={bb_lower}, "
                 f"ATR={atr}, EMA9={ema9}, "
-                f"눌림목={pullback}"
+                f"눌림목={pullback}, "
+                f"ADX={adx if adx is not None else 'N/A'}, "
+                f"Stoch%K={stoch_k if stoch_k is not None else 'N/A'}, "
+                f"Stoch%D={stoch_d if stoch_d is not None else 'N/A'}, "
+                f"VWAP={vwap if vwap is not None else 'N/A'}, "
+                f"캔들패턴=[{candle_str}], "
+                f"쌍바닥={double_bottom}, "
+                f"POC={poc}, POC위={above_poc}, 두꺼운매물대={heavy_res}, "
+                f"지지={support}, 저항={resistance}, "
+                f"지지근처={near_support}, 저항근처={near_resistance}, "
+                f"외국인순매수={foreign_net:+,}, 기관순매수={institution_net:+,}, "
+                f"외국인매수중={foreign_buying}"
             )
 
         lines.append("\n## 현재 보유 포지션")
         if positions:
             for p in positions:
-                ts_info = ""
                 lines.append(
                     f"- {p['symbol']}: {p['quantity']}주 @ {p['avg_price']}원 "
                     f"(현재 {p.get('pnl_pct', 0):+.1f}%, "
                     f"손절가={p.get('stop_price', 0)}, 목표가={p.get('target_price', 0)})"
-                    f"{ts_info}"
                 )
         else:
             lines.append("- 없음")

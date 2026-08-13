@@ -6,7 +6,14 @@ from loguru import logger
 
 from config.settings import KIS_MOCK
 from core.broker.kis import KISBroker
-from core.indicators import compute_all, is_pullback
+from core.indicators import (
+    calc_volume_profile,
+    compute_all,
+    detect_candle_patterns,
+    detect_double_bottom,
+    detect_support_resistance,
+    is_pullback,
+)
 
 
 class DataFetcher:
@@ -66,7 +73,39 @@ class DataFetcher:
         except Exception as e:
             logger.warning(f"[Fetcher] {symbol} pullback 감지 실패: {e}")
 
-        return {
+        # 캔들 패턴 감지
+        candle_patterns: dict = {}
+        try:
+            if not df.empty:
+                candle_patterns = detect_candle_patterns(df)
+        except Exception as e:
+            logger.warning(f"[Fetcher] {symbol} 캔들 패턴 감지 실패: {e}")
+
+        # 지지/저항 감지
+        support_resistance: dict = {}
+        try:
+            if not df.empty:
+                support_resistance = detect_support_resistance(df)
+        except Exception as e:
+            logger.warning(f"[Fetcher] {symbol} 지지저항 감지 실패: {e}")
+
+        # 쌍바닥 패턴
+        double_bottom: bool = False
+        try:
+            if not df.empty:
+                double_bottom = detect_double_bottom(df)
+        except Exception as e:
+            logger.warning(f"[Fetcher] {symbol} 쌍바닥 감지 실패: {e}")
+
+        # 매물대 계산
+        volume_profile: dict = {}
+        try:
+            if not df.empty:
+                volume_profile = calc_volume_profile(df)
+        except Exception as e:
+            logger.warning(f"[Fetcher] {symbol} 매물대 계산 실패: {e}")
+
+        result: dict = {
             "ticker": symbol,
             "current_price": current_price,
             "volume": volume,
@@ -88,7 +127,33 @@ class DataFetcher:
             "ema9": indicators.get("ema9"),
             "ema21": indicators.get("ema21"),
             "pullback_detected": pullback_detected,
+            # 신규 지표
+            "adx": indicators.get("adx"),
+            "stoch_k": indicators.get("stoch_k"),
+            "stoch_d": indicators.get("stoch_d"),
+            "vwap": indicators.get("vwap"),
+            "pivot": indicators.get("pivot"),
+            "r1": indicators.get("r1"),
+            "s1": indicators.get("s1"),
+            "momentum": indicators.get("momentum"),
+            # 쌍바닥
+            "double_bottom": double_bottom,
+            # 외국인/기관 (기본값 — engine에서 kis_extra로 채움)
+            "foreign_net": 0,
+            "institution_net": 0,
+            "individual_net": 0,
+            "foreign_buying": False,
+            "program_net": 0,
         }
+
+        # 캔들 패턴 병합
+        result.update(candle_patterns)
+        # 지지/저항 병합
+        result.update(support_resistance)
+        # 매물대 병합
+        result.update(volume_profile)
+
+        return result
 
     async def fetch_ohlcv(self, symbol: str, period: int = 60) -> pd.DataFrame:
         try:
@@ -163,4 +228,39 @@ class DataFetcher:
             "ema9": None,
             "ema21": None,
             "pullback_detected": False,
+            # 신규 지표 (더미)
+            "adx": None,
+            "stoch_k": None,
+            "stoch_d": None,
+            "vwap": None,
+            "pivot": None,
+            "r1": None,
+            "s1": None,
+            "momentum": None,
+            # 캔들 패턴 (더미)
+            "hammer": False,
+            "doji": False,
+            "bullish_engulfing": False,
+            "bearish_engulfing": False,
+            "shooting_star": False,
+            "morning_star": False,
+            # 지지/저항 (더미)
+            "support": None,
+            "resistance": None,
+            "near_support": False,
+            "near_resistance": False,
+            # 쌍바닥 (더미)
+            "double_bottom": False,
+            # 매물대 (더미)
+            "poc": None,
+            "value_area_high": None,
+            "value_area_low": None,
+            "above_poc": False,
+            "heavy_resistance": False,
+            # 외국인/기관 (더미)
+            "foreign_net": 0,
+            "institution_net": 0,
+            "individual_net": 0,
+            "foreign_buying": False,
+            "program_net": 0,
         }

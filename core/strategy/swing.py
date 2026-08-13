@@ -63,6 +63,14 @@ class SwingStrategy(BaseStrategy):
                 macd = d.get("macd")
                 current_price = d.get("current_price", 0.0)
                 pct_from_high = d.get("pct_from_high", 100.0)
+                stoch_k = d.get("stoch_k")
+                adx = d.get("adx")
+                hammer = d.get("hammer", False)
+                bullish_engulfing = d.get("bullish_engulfing", False)
+                heavy_resistance = d.get("heavy_resistance", False)
+                double_bottom = d.get("double_bottom", False)
+                foreign_buying = d.get("foreign_buying", False)
+                near_support = d.get("near_support", False)
 
                 if rsi is None or macd is None or not current_price:
                     continue
@@ -77,7 +85,7 @@ class SwingStrategy(BaseStrategy):
                     score = (rsi - rsi_low) + (macd * 100)
                     reasons = [
                         "스윙 매수: 눌림목 감지",
-                        f"MA20 위 유지",
+                        "MA20 위 유지",
                         f"RSI={rsi:.1f}({rsi_low}~{rsi_high})",
                         f"MACD={macd:.4f}(양수)",
                     ]
@@ -86,6 +94,44 @@ class SwingStrategy(BaseStrategy):
                     if pct_from_high is not None and pct_from_high <= w52_thresh:
                         score += w52_bonus
                         reasons.append(f"52주고점 {pct_from_high:.1f}% 이내 — 돌파 임박 보너스")
+
+                    # Stochastic %K < 20 → 과매도 보너스
+                    if stoch_k is not None and stoch_k < 20:
+                        score += 8.0
+                        reasons.append(f"Stoch%K={stoch_k:.1f}(과매도)")
+
+                    # ADX > 25 → 추세 강함 보너스
+                    if adx is not None and adx > 25:
+                        score += 7.0
+                        reasons.append(f"ADX={adx:.1f}(추세강함)")
+
+                    # 망치형 or 불리시 장악형 보너스
+                    if hammer:
+                        score += 8.0
+                        reasons.append("망치형캔들")
+                    if bullish_engulfing:
+                        score += 10.0
+                        reasons.append("불리시장악형")
+
+                    # 두꺼운 매물대 페널티
+                    if heavy_resistance:
+                        score -= 12.0
+                        reasons.append("두꺼운매물대(페널티)")
+
+                    # 쌍바닥 보너스 (스윙에서 특히 중요)
+                    if double_bottom:
+                        score += 20.0
+                        reasons.append("쌍바닥패턴(강력매수)")
+
+                    # 지지선 근처 보너스
+                    if near_support:
+                        score += 8.0
+                        reasons.append("지지선 근처")
+
+                    # 외국인 순매수 보너스
+                    if foreign_buying:
+                        score += 7.0
+                        reasons.append("외국인순매수")
 
                     reason = ". ".join(reasons) + f". 손절-{stop_pct}%/익절+{tp_pct}~15%"
                     signals.append(
@@ -101,6 +147,8 @@ class SwingStrategy(BaseStrategy):
                                 "macd": macd,
                                 "pct_from_high": pct_from_high,
                                 "pullback": pullback,
+                                "adx": adx,
+                                "stoch_k": stoch_k,
                                 "stop_pct": stop_pct,
                                 "take_profit_pct": tp_pct,
                             },
