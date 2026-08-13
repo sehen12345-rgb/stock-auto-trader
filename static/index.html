@@ -268,6 +268,67 @@
   @media (max-width: 400px) {
     .mchip-value { font-size: 0.9rem; }
   }
+
+  /* ── 매매 모드 선택기 ── */
+  .mode-selector {
+    display: flex; gap: 8px; flex-wrap: wrap; margin-bottom: 20px; align-items: center;
+  }
+  .mode-label { font-size: 0.72rem; color: var(--muted); font-weight: 700; text-transform: uppercase; letter-spacing: 0.06em; margin-right: 4px; }
+  .mode-btn {
+    border: 1.5px solid var(--border); border-radius: 8px; font-size: 0.8rem; font-weight: 700;
+    cursor: pointer; padding: 6px 16px; background: var(--surface2); color: var(--muted);
+    transition: all .15s;
+  }
+  .mode-btn:hover { border-color: var(--blue); color: var(--text); }
+  .mode-btn.active { background: var(--blue); border-color: var(--blue); color: #000; }
+  .mode-btn.active.m-scalping  { background: var(--red);    border-color: var(--red);    color: #fff; }
+  .mode-btn.active.m-day       { background: var(--yellow); border-color: var(--yellow); color: #000; }
+  .mode-btn.active.m-swing     { background: var(--green);  border-color: var(--green);  color: #000; }
+  .mode-btn.active.m-long      { background: var(--blue);   border-color: var(--blue);   color: #000; }
+
+  /* ── 기술 지표 배지 ── */
+  .ind-badge {
+    display: inline-flex; align-items: center; gap: 3px;
+    padding: 1px 6px; border-radius: 5px; font-size: 0.62rem; font-weight: 700;
+    margin-top: 3px; margin-right: 3px;
+  }
+  .ind-rsi-ob { background: rgba(255,71,87,0.18); color: var(--red); }
+  .ind-rsi-os { background: rgba(0,200,150,0.18); color: var(--green); }
+  .ind-rsi-neu{ background: rgba(136,136,170,0.15); color: var(--muted); }
+  .ind-macd-up{ background: rgba(0,200,150,0.15); color: var(--green); }
+  .ind-macd-dn{ background: rgba(255,71,87,0.12); color: var(--red); }
+  .ind-bb-low { background: rgba(76,201,240,0.15); color: var(--blue); }
+  .ind-bb-hi  { background: rgba(255,209,102,0.15); color: var(--yellow); }
+  .ind-pb     { background: rgba(255,209,102,0.2); color: var(--yellow); }
+
+  /* ── 트레일링 스탑 뱃지 ── */
+  .ts-badge {
+    display: inline-block; padding: 1px 6px; border-radius: 4px;
+    font-size: 0.65rem; font-weight: 700;
+    background: rgba(76,201,240,0.2); color: var(--blue);
+    border: 1px solid rgba(76,201,240,0.4);
+  }
+
+  /* ── 백테스트 패널 ── */
+  .bt-form { display: flex; gap: 8px; flex-wrap: wrap; margin-bottom: 14px; align-items: flex-end; }
+  .bt-form input, .bt-form select {
+    background: var(--surface2); border: 1px solid var(--border);
+    color: var(--text); border-radius: 8px; padding: 8px 12px; font-size: 0.82rem; outline: none;
+  }
+  .bt-form input:focus, .bt-form select:focus { border-color: var(--green); }
+  .bt-form select option { background: var(--surface2); }
+  .bt-results {
+    display: grid; grid-template-columns: repeat(auto-fill, minmax(130px, 1fr)); gap: 10px;
+    margin-top: 10px;
+  }
+  .bt-stat {
+    background: var(--surface2); border: 1px solid var(--border); border-radius: 8px;
+    padding: 10px 14px;
+  }
+  .bt-stat-label { font-size: 0.62rem; color: var(--muted); text-transform: uppercase; letter-spacing: 0.06em; margin-bottom: 4px; }
+  .bt-stat-value { font-size: 1.05rem; font-weight: 800; }
+  .bt-trades { margin-top: 12px; max-height: 200px; overflow-y: auto; }
+  .bt-loading { color: var(--muted); font-size: 0.82rem; padding: 12px 0; }
 </style>
 </head>
 <body>
@@ -301,6 +362,16 @@
 
 <!-- ══════════════ 본문 ══════════════ -->
 <div class="container">
+
+  <!-- 매매 모드 선택기 -->
+  <div class="mode-selector">
+    <span class="mode-label">매매 모드</span>
+    <button class="mode-btn m-scalping" id="mode-scalping"   onclick="setMode('scalping')">⚡ 스캘핑</button>
+    <button class="mode-btn m-day"      id="mode-day_trading" onclick="setMode('day_trading')">📈 단타</button>
+    <button class="mode-btn m-swing"    id="mode-swing"      onclick="setMode('swing')">🌊 스윙</button>
+    <button class="mode-btn m-long active" id="mode-long_term" onclick="setMode('long_term')">🏔️ 장기(올랜도킴)</button>
+    <span id="mode-info" style="font-size:.72rem;color:var(--muted);margin-left:8px"></span>
+  </div>
 
   <!-- 시장 수익률 바 -->
   <div class="market-bar">
@@ -386,6 +457,28 @@
     <div class="wl-grid" id="watchlist-grid">
       <div class="empty">관심종목 없음</div>
     </div>
+  </div>
+
+  <!-- 백테스트 패널 -->
+  <div class="panel" style="margin-bottom:16px">
+    <div class="panel-title">백테스트</div>
+    <div class="bt-form">
+      <input id="bt-ticker" placeholder="종목코드 (예: 005930, NVDA)" style="width:180px" maxlength="12">
+      <select id="bt-strategy">
+        <option value="scalping">스캘핑 (-1%/+1.5%)</option>
+        <option value="day_trading">단타 (-2%/+4%)</option>
+        <option value="swing">스윙 (-3.5%/+8%)</option>
+        <option value="long_term" selected>장기/올랜도킴 (-3.5%/+6%)</option>
+      </select>
+      <select id="bt-period">
+        <option value="30">30일</option>
+        <option value="90" selected>90일</option>
+        <option value="180">180일</option>
+        <option value="252">252일(1년)</option>
+      </select>
+      <button class="btn btn-add" onclick="runBacktest()">▶ 백테스트 실행</button>
+    </div>
+    <div id="bt-output"></div>
   </div>
 
   <!-- 로그 -->
@@ -600,11 +693,14 @@ async function refreshPositions() {
       <table>
         <thead><tr>
           <th>종목</th><th>수량</th><th>평단가</th><th>현재가</th>
-          <th>수익률</th><th>매입금액</th><th>진입일</th><th>OCO</th>
+          <th>수익률</th><th>매입금액</th><th>진입일</th><th>상태</th>
         </tr></thead>
         <tbody>
           ${pos.map(p => {
             const cls = pctClass(p.pnl_pct);
+            const tsBadge = p.trailing_stop_active
+              ? '<span class="ts-badge">TS 활성</span>'
+              : (p.oco_active ? '<span class="oco">OCO</span>' : '-');
             return `<tr>
               <td><b>${p.symbol}</b><br><span style="font-size:.7rem;color:var(--muted)">${p.name||''}</span></td>
               <td>${fmt(p.quantity)}주</td>
@@ -613,7 +709,7 @@ async function refreshPositions() {
               <td class="${cls}" style="font-weight:700">${fmtPct(p.pnl_pct)}</td>
               <td>${fmt(Math.round((p.avg_price||0)*(p.quantity||0)))}원</td>
               <td>${p.opened_at ? p.opened_at.slice(0,10) : '-'}</td>
-              <td>${p.oco_active ? '<span class="oco">활성</span>' : '-'}</td>
+              <td>${tsBadge}</td>
             </tr>`;
           }).join('')}
         </tbody>
@@ -677,6 +773,28 @@ async function refreshWatchlist() {
       const volText = item.volume_ratio != null
         ? `<div class="wl-dist neutral">거래량 ${item.volume_ratio.toFixed(1)}배</div>`
         : '';
+
+      // 기술 지표 배지
+      let indBadges = '';
+      if (item.rsi != null) {
+        const rsiCls = item.rsi < 35 ? 'ind-rsi-os' : item.rsi > 65 ? 'ind-rsi-ob' : 'ind-rsi-neu';
+        indBadges += `<span class="ind-badge ${rsiCls}">RSI ${item.rsi.toFixed(0)}</span>`;
+      }
+      if (item.macd != null && item.macd_signal != null) {
+        const macdUp = item.macd > item.macd_signal;
+        indBadges += `<span class="ind-badge ${macdUp ? 'ind-macd-up' : 'ind-macd-dn'}">MACD ${macdUp ? '↑' : '↓'}</span>`;
+      }
+      if (item.bb_lower != null && item.current_price != null) {
+        if (item.current_price <= item.bb_lower * 1.02) {
+          indBadges += `<span class="ind-badge ind-bb-low">BB하단</span>`;
+        } else if (item.bb_upper != null && item.current_price >= item.bb_upper * 0.98) {
+          indBadges += `<span class="ind-badge ind-bb-hi">BB상단</span>`;
+        }
+      }
+      if (item.pullback_detected) {
+        indBadges += `<span class="ind-badge ind-pb">눌림목</span>`;
+      }
+
       return `
         <div class="wl-card">
           <button class="btn-del wl-del" onclick="delWatchlist('${item.ticker}')">✕</button>
@@ -685,6 +803,7 @@ async function refreshWatchlist() {
           <div class="wl-price">${item.current_price != null ? fmt(item.current_price) + '원' : '-'}</div>
           ${distText ? `<div class="wl-dist ${distCls}">${distText}</div>` : ''}
           ${volText}
+          ${indBadges ? `<div style="margin-top:5px">${indBadges}</div>` : ''}
         </div>`;
     }).join('');
   } catch(e) { addLog('관심종목 조회 실패: ' + e.message, 'err'); }
@@ -776,6 +895,7 @@ async function refreshAll() {
     refreshPositions(),
     refreshDecisions(),
     refreshWatchlist(),
+    refreshTradingMode(),
   ]);
 }
 
@@ -823,6 +943,154 @@ refreshDecisions = async function() {
   await _origRefreshDecisions();
   try { _lastDecisions = await api('/api/decisions'); } catch(_) {}
 };
+
+/* ════════════════════════════════════════
+   매매 모드 선택기
+════════════════════════════════════════ */
+const MODE_LABELS = {
+  scalping:    '스캘핑 (손절-1%/익절+1.5%, 10초 틱)',
+  day_trading: '단타 (손절-2%/익절+4%, 30초 틱)',
+  swing:       '스윙 (손절-3.5%/익절+8%, 5분 틱)',
+  long_term:   '장기/올랜도킴 (손절-3.5%/익절+6%, 5분 틱)',
+};
+const MODE_ID_MAP = {
+  scalping: 'mode-scalping',
+  day_trading: 'mode-day_trading',
+  swing: 'mode-swing',
+  long_term: 'mode-long_term',
+};
+const MODE_CLASS_MAP = {
+  scalping: 'm-scalping',
+  day_trading: 'm-day',
+  swing: 'm-swing',
+  long_term: 'm-long',
+};
+
+let _currentMode = 'long_term';
+
+async function setMode(mode) {
+  try {
+    await api('/api/trading-mode', 'POST', { mode });
+    _currentMode = mode;
+    updateModeUI(mode);
+    addLog(`매매 모드 변경: ${MODE_LABELS[mode] || mode}`);
+  } catch(e) {
+    addLog('모드 변경 실패: ' + e.message, 'err');
+  }
+}
+
+function updateModeUI(mode) {
+  // 모든 버튼 비활성
+  Object.keys(MODE_ID_MAP).forEach(m => {
+    const btn = $(MODE_ID_MAP[m]);
+    if (!btn) return;
+    btn.classList.remove('active', 'm-scalping', 'm-day', 'm-swing', 'm-long');
+    btn.classList.add(MODE_CLASS_MAP[m]);
+  });
+  // 활성 버튼
+  const activeBtn = $(MODE_ID_MAP[mode]);
+  if (activeBtn) activeBtn.classList.add('active');
+  // 설명 텍스트
+  const info = $('mode-info');
+  if (info) info.textContent = MODE_LABELS[mode] || '';
+}
+
+async function refreshTradingMode() {
+  try {
+    const data = await api('/api/trading-mode');
+    _currentMode = data.mode || 'long_term';
+    updateModeUI(_currentMode);
+  } catch(_) {}
+}
+
+/* ════════════════════════════════════════
+   백테스트
+════════════════════════════════════════ */
+async function runBacktest() {
+  const ticker = $('bt-ticker').value.trim().toUpperCase();
+  const strategy = $('bt-strategy').value;
+  const period_days = parseInt($('bt-period').value);
+  if (!ticker) { addLog('백테스트: 종목코드를 입력하세요', 'warn'); return; }
+
+  const out = $('bt-output');
+  out.innerHTML = '<div class="bt-loading">백테스트 실행 중...</div>';
+
+  try {
+    const r = await api('/api/backtest', 'POST', { ticker, strategy, period_days });
+
+    if (r.error) {
+      out.innerHTML = `<div class="bt-loading" style="color:var(--red)">${r.error}</div>`;
+      return;
+    }
+
+    const wr = r.win_rate ?? 0;
+    const wrCls = wr >= 55 ? 'pos' : wr >= 45 ? 'neutral' : 'neg';
+    const ret = r.total_return ?? 0;
+    const retCls = ret >= 0 ? 'pos' : 'neg';
+    const mdd = r.max_drawdown ?? 0;
+    const pf = r.profit_factor ?? 0;
+    const pfCls = pf >= 1.5 ? 'pos' : pf >= 1.0 ? 'neutral' : 'neg';
+    const sharpe = r.sharpe_ratio ?? 0;
+
+    const trades = r.trades || [];
+    const tradeRows = trades.slice(0, 20).map(t => {
+      const pc = t.pnl_pct >= 0 ? 'pos' : 'neg';
+      return `<tr>
+        <td>#${t.entry_idx}</td>
+        <td>${t.entry_price?.toFixed(0) ?? '-'}</td>
+        <td>${t.exit_price?.toFixed(0) ?? '-'}</td>
+        <td class="${pc}">${t.pnl_pct >= 0 ? '+' : ''}${t.pnl_pct?.toFixed(2) ?? '-'}%</td>
+        <td>${t.exit_reason || '-'}</td>
+      </tr>`;
+    }).join('');
+
+    out.innerHTML = `
+      <div class="bt-results">
+        <div class="bt-stat">
+          <div class="bt-stat-label">총 거래</div>
+          <div class="bt-stat-value">${r.total_trades}회</div>
+        </div>
+        <div class="bt-stat">
+          <div class="bt-stat-label">승률</div>
+          <div class="bt-stat-value ${wrCls}">${wr.toFixed(1)}%</div>
+        </div>
+        <div class="bt-stat">
+          <div class="bt-stat-label">총 수익률</div>
+          <div class="bt-stat-value ${retCls}">${ret >= 0 ? '+' : ''}${ret.toFixed(2)}%</div>
+        </div>
+        <div class="bt-stat">
+          <div class="bt-stat-label">최대 낙폭</div>
+          <div class="bt-stat-value neg">-${mdd.toFixed(2)}%</div>
+        </div>
+        <div class="bt-stat">
+          <div class="bt-stat-label">손익비(PF)</div>
+          <div class="bt-stat-value ${pfCls}">${pf === 9999 ? '∞' : pf.toFixed(2)}</div>
+        </div>
+        <div class="bt-stat">
+          <div class="bt-stat-label">샤프 비율</div>
+          <div class="bt-stat-value ${sharpe >= 1 ? 'pos' : 'neutral'}">${sharpe.toFixed(2)}</div>
+        </div>
+      </div>
+      ${trades.length > 0 ? `
+      <div class="bt-trades tbl-wrap">
+        <table>
+          <thead><tr><th>진입봉</th><th>진입가</th><th>청산가</th><th>수익률</th><th>청산사유</th></tr></thead>
+          <tbody>${tradeRows}</tbody>
+        </table>
+      </div>` : ''}`;
+
+    addLog(`백테스트 완료: ${ticker} ${strategy} → 승률 ${wr.toFixed(1)}% 총수익 ${ret >= 0 ? '+' : ''}${ret.toFixed(2)}%`);
+  } catch(e) {
+    out.innerHTML = `<div class="bt-loading" style="color:var(--red)">오류: ${e.message}</div>`;
+    addLog('백테스트 실패: ' + e.message, 'err');
+  }
+}
+
+/* ════════════════════════════════════════
+   초기화 추가
+════════════════════════════════════════ */
+refreshTradingMode();
+$('bt-ticker').addEventListener('keydown', e => { if (e.key === 'Enter') runBacktest(); });
 </script>
 </body>
 </html>

@@ -6,6 +6,29 @@ from loguru import logger
 
 SYSTEM_PROMPT = """당신은 올랜도킴 매매 전략을 따르는 AI 트레이더입니다.
 
+## 매매 모드별 규칙
+
+### 스캘핑 (scalping) — 10초 틱, 초단타
+- 진입: RSI < 35 AND 거래량 1.5배↑ AND 현재가 > EMA9
+- 청산: 손절 -1% / 익절 +1.5% (엄격 준수)
+- 트레일링 스탑: 최고가 대비 -2% 이탈 즉시 청산
+- 주의: 스프레드·슬리피지 고려, 극소량만 매수
+
+### 단타 (day_trading) — 30초 틱
+- 진입: MACD 골든크로스 AND RSI 40~65 AND 현재가 > MA20
+- 볼린저 하단 터치 후 반등 시 추가 확신 부여
+- 청산: 손절 -2% / 익절 +4%
+- 당일 청산 원칙
+
+### 스윙 (swing) — 5분 틱
+- 진입: 눌림목(고점 대비 3~10% 되돌림 후 반등) AND MA20 위 AND RSI 40~60 AND MACD > 0
+- 52주 고점 10% 이내 → 강력 추가 점수
+- 청산: 손절 -3.5% / 익절 +8~15%
+
+### 장기 올랜도킴 (long_term) — 5분 틱
+- 진입: MA20 위 + 거래량 1.5배↑ + 하락추세선 돌파 + 쌍바닥 패턴
+- 청산: 손절 -3.5% / 익절 +4~8% 단계적 청산
+
 ## 핵심 매매 규칙
 
 ### 매수 조건 (모두 충족해야 진입)
@@ -93,6 +116,7 @@ class LLMJudge:
         market_data: dict[str, Any],
         positions: list[dict[str, Any]],
         watchlist: dict[str, str],
+        trading_mode: str = "long_term",
     ) -> dict[str, Any]:
         if self._client is None:
             result = self._rule_based_judge(market_data, positions)
@@ -100,7 +124,7 @@ class LLMJudge:
                         f"확신도:{result.get('confidence')}%")
             return result
 
-        prompt = self._build_prompt(market_data, positions, watchlist)
+        prompt = self._build_prompt(market_data, positions, watchlist, trading_mode)
         try:
             response = self._client.messages.create(
                 model="claude-sonnet-4-6",
@@ -229,28 +253,55 @@ class LLMJudge:
         market_data: dict[str, Any],
         positions: list[dict[str, Any]],
         watchlist: dict[str, str],
+        trading_mode: str = "long_term",
     ) -> str:
-        lines = ["## 현재 시세 데이터"]
+        mode_labels = {
+            "scalping": "스캘핑 (손절-1%/익절+1.5%)",
+            "day_trading": "단타 (손절-2%/익절+4%)",
+            "swing": "스윙 (손절-3.5%/익절+8~15%)",
+            "long_term": "장기/올랜도킴 (손절-3.5%/익절+4~8%)",
+        }
+        mode_label = mode_labels.get(trading_mode, trading_mode)
+
+        lines = [f"## 현재 매매 모드: {mode_label}", "", "## 현재 시세 데이터 (기술 지표 포함)"]
         for ticker, data in market_data.items():
+            rsi = data.get("rsi")
+            macd = data.get("macd")
+            macd_sig = data.get("macd_signal")
+            bb_upper = data.get("bb_upper")
+            bb_lower = data.get("bb_lower")
+            atr = data.get("atr")
+            ema9 = data.get("ema9")
+            pullback = data.get("pullback_detected", False)
+
+            # MACD 방향
+            macd_dir = ""
+            if macd is not None and macd_sig is not None:
+                macd_dir = "골든크로스↑" if macd > macd_sig else "데드크로스↓"
+
             lines.append(
                 f"- {ticker}: 현재가={data.get('current_price')}, "
                 f"MA20={data.get('ma20')}, "
-                f"거래량={data.get('volume')}, "
-                f"평균거래량={data.get('avg_volume_20')}, "
                 f"거래량비율={data.get('volume_ratio')}, "
-                f"52주고점={data.get('week52_high')}, "
-                f"고점대비={data.get('pct_from_high')}%, "
+                f"52주고점대비=-{data.get('pct_from_high')}%, "
                 f"MA20상위={data.get('above_ma20')}, "
-                f"거래량급증={data.get('volume_surge')}"
+                f"거래량급증={data.get('volume_surge')}, "
+                f"RSI={rsi if rsi is not None else 'N/A'}, "
+                f"MACD={macd_dir}({round(macd, 4) if macd is not None else 'N/A'}), "
+                f"BB상단={bb_upper}, BB하단={bb_lower}, "
+                f"ATR={atr}, EMA9={ema9}, "
+                f"눌림목={pullback}"
             )
 
         lines.append("\n## 현재 보유 포지션")
         if positions:
             for p in positions:
+                ts_info = ""
                 lines.append(
                     f"- {p['symbol']}: {p['quantity']}주 @ {p['avg_price']}원 "
                     f"(현재 {p.get('pnl_pct', 0):+.1f}%, "
                     f"손절가={p.get('stop_price', 0)}, 목표가={p.get('target_price', 0)})"
+                    f"{ts_info}"
                 )
         else:
             lines.append("- 없음")
@@ -259,5 +310,9 @@ class LLMJudge:
         for t, n in watchlist.items():
             lines.append(f"- {t} ({n})")
 
-        lines.append("\n위 데이터를 바탕으로 올랜도킴 전략의 핵심 규칙에 따라 지금 당장 실행할 최선의 매매 판단을 JSON으로 반환하세요.")
+        lines.append(
+            f"\n현재 매매 모드는 **{mode_label}**입니다. "
+            "위 데이터를 바탕으로 현재 모드의 전략 규칙에 따라 "
+            "지금 당장 실행할 최선의 매매 판단을 JSON으로 반환하세요."
+        )
         return "\n".join(lines)

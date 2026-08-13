@@ -6,6 +6,7 @@ from loguru import logger
 
 from config.settings import KIS_MOCK
 from core.broker.kis import KISBroker
+from core.indicators import compute_all, is_pullback
 
 
 class DataFetcher:
@@ -45,6 +46,21 @@ class DataFetcher:
 
         volume_ratio = round(volume / avg_volume_20, 2) if avg_volume_20 > 0 else 0.0
 
+        # 기술 지표 계산 (try/except 로 봇 중단 방지)
+        indicators: dict[str, Any] = {}
+        try:
+            if not df.empty:
+                indicators = compute_all(df)
+        except Exception as e:
+            logger.warning(f"[Fetcher] {symbol} 기술 지표 계산 실패: {e}")
+
+        pullback_detected: bool = False
+        try:
+            if not df.empty:
+                pullback_detected = is_pullback(df)
+        except Exception as e:
+            logger.warning(f"[Fetcher] {symbol} pullback 감지 실패: {e}")
+
         return {
             "ticker": symbol,
             "current_price": current_price,
@@ -56,6 +72,17 @@ class DataFetcher:
             "volume_ratio": volume_ratio,
             "above_ma20": current_price > ma20 if ma20 > 0 else False,
             "volume_surge": volume_ratio >= 1.5,
+            # 기술 지표
+            "rsi": indicators.get("rsi"),
+            "macd": indicators.get("macd"),
+            "macd_signal": indicators.get("macd_signal"),
+            "macd_hist": indicators.get("macd_hist"),
+            "bb_upper": indicators.get("bb_upper"),
+            "bb_lower": indicators.get("bb_lower"),
+            "atr": indicators.get("atr"),
+            "ema9": indicators.get("ema9"),
+            "ema21": indicators.get("ema21"),
+            "pullback_detected": pullback_detected,
         }
 
     async def fetch_ohlcv(self, symbol: str, period: int = 60) -> pd.DataFrame:
@@ -120,4 +147,15 @@ class DataFetcher:
             "volume_ratio": 0.0,
             "above_ma20": False,
             "volume_surge": False,
+            # 기술 지표 (더미)
+            "rsi": None,
+            "macd": None,
+            "macd_signal": None,
+            "macd_hist": None,
+            "bb_upper": None,
+            "bb_lower": None,
+            "atr": None,
+            "ema9": None,
+            "ema21": None,
+            "pullback_detected": False,
         }

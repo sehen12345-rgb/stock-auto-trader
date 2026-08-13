@@ -18,6 +18,17 @@ STOP_LOSS_PCT: float = 3.5
 TAKE_PROFIT_PCT: float = 6.0
 MAX_DAILY_LOSS: int = 300_000  # 일 손실 한도 30만원
 
+# 매매 모드별 설정
+TRADING_MODE_CONFIG: dict[str, dict[str, Any]] = {
+    "scalping":    {"tick_interval": 10,  "stop_pct": 1.0, "take_profit_pct": 1.5},
+    "day_trading": {"tick_interval": 30,  "stop_pct": 2.0, "take_profit_pct": 4.0},
+    "swing":       {"tick_interval": 300, "stop_pct": 3.5, "take_profit_pct": 8.0},
+    "long_term":   {"tick_interval": 300, "stop_pct": 3.5, "take_profit_pct": 6.0},
+}
+
+# 트레일링 스탑 하락 허용 % (최고가 대비)
+TRAILING_STOP_PCT: float = 2.0
+
 
 class TradingEngine:
     _instance: "TradingEngine | None" = None
@@ -47,6 +58,11 @@ class TradingEngine:
         self._decisions: list[dict[str, Any]] = []
         self._watchlist: dict[str, str] = {}
         self._task: asyncio.Task | None = None
+
+        # 매매 모드
+        self.trading_mode: str = "long_term"
+        # 트레일링 스탑: {symbol: 최고가}
+        self._trailing_stops: dict[str, float] = {}
 
         # 올랜도킴 기본 관심종목 (우량주 위주)
         _DEFAULT_WATCHLIST: dict[str, str] = {
@@ -124,7 +140,9 @@ class TradingEngine:
                         self._market_open_notified = False
                         asyncio.create_task(_safe(self._notify_market_close()))
 
-                await asyncio.sleep(30)
+                # 모드별 tick interval
+                interval = TRADING_MODE_CONFIG.get(self.trading_mode, {}).get("tick_interval", 30)
+                await asyncio.sleep(interval)
             except asyncio.CancelledError:
                 break
             except Exception as e:
@@ -169,25 +187,169 @@ class TradingEngine:
         # 손절/익절 자동 체크 (장 중)
         if not DEMO_MODE and self._is_market_hours():
             await self._check_stop_conditions(positions, market_data)
+            # 트레일링 스탑 체크
+            await self._check_trailing_stops(positions, market_data)
             positions = await self.get_positions()
+
+        # 전략 신호 생성 (기술 지표 기반)
+        strategy_signal: dict[str, Any] | None = None
+        try:
+            strategy_signal = self._generate_strategy_signal(market_data, positions)
+            if strategy_signal:
+                logger.info(f"[Engine] 전략 신호: {strategy_signal.get('decision')} "
+                            f"{strategy_signal.get('ticker')} score={strategy_signal.get('score', 0):.2f}")
+        except Exception as e:
+            logger.warning(f"[Engine] 전략 신호 생성 오류: {e}")
 
         try:
             decision = await self.judge.judge(
                 market_data=market_data,
                 positions=positions,
                 watchlist=self._watchlist,
+                trading_mode=self.trading_mode,
             )
             self.llm_call_count += 1
-            self._decisions.insert(0, {**decision, "timestamp": datetime.now().isoformat(timespec="seconds")})
+
+            # 전략 신호와 LLM 판단 통합 (전략 BUY + LLM BUY/HOLD → 우선 실행)
+            final_decision = self._merge_signals(strategy_signal, decision)
+
+            self._decisions.insert(0, {**final_decision, "timestamp": datetime.now().isoformat(timespec="seconds")})
             self._decisions = self._decisions[:50]
 
             from api.websocket import broadcast
-            await broadcast({"type": "decision", "data": decision})
+            await broadcast({"type": "decision", "data": final_decision})
 
-            if decision.get("decision") in ("BUY", "SELL"):
-                await self._execute(decision, positions, market_data)
+            if final_decision.get("decision") in ("BUY", "SELL"):
+                await self._execute(final_decision, positions, market_data)
         except Exception as e:
             logger.error(f"[Engine] LLM 판단 에러: {e}")
+
+    def set_trading_mode(self, mode: str) -> None:
+        """매매 모드 변경.
+
+        Args:
+            mode: "scalping" | "day_trading" | "swing" | "long_term"
+        """
+        if mode not in TRADING_MODE_CONFIG:
+            raise ValueError(f"지원하지 않는 모드: {mode}. 허용: {list(TRADING_MODE_CONFIG.keys())}")
+        self.trading_mode = mode
+        cfg = TRADING_MODE_CONFIG[mode]
+        logger.info(f"[Engine] 매매 모드 변경: {mode} "
+                    f"(tick={cfg['tick_interval']}s, "
+                    f"stop={cfg['stop_pct']}%, tp={cfg['take_profit_pct']}%)")
+
+    def _generate_strategy_signal(
+        self,
+        market_data: dict[str, Any],
+        positions: list[dict[str, Any]],
+    ) -> dict[str, Any] | None:
+        """현재 매매 모드에 맞는 전략 신호 생성."""
+        try:
+            held = {p.get("symbol") for p in positions}
+            mode = self.trading_mode
+
+            if mode == "scalping":
+                from core.strategy.scalping import ScalpingStrategy
+                strategy = ScalpingStrategy()
+            elif mode == "day_trading":
+                from core.strategy.day_trading import DayTradingStrategy
+                strategy = DayTradingStrategy()
+            elif mode == "swing":
+                from core.strategy.swing import SwingStrategy
+                strategy = SwingStrategy()
+            else:
+                return None  # long_term은 LLM에 위임
+
+            # 미보유 종목만 신호 대상
+            filtered_data = {t: d for t, d in market_data.items() if t not in held}
+            signals = strategy.generate_signals(filtered_data)
+
+            if not signals:
+                return None
+
+            # 점수가 가장 높은 BUY 신호 선택
+            buy_signals = [s for s in signals if s.signal_type.value == "BUY"]
+            if not buy_signals:
+                return None
+
+            best = max(buy_signals, key=lambda s: s.score)
+            cfg = TRADING_MODE_CONFIG.get(mode, {})
+            price = best.price or 0
+            qty = max(1, int(MAX_PER_SLOT // price)) if price > 0 else 1
+
+            return {
+                "decision": "BUY",
+                "ticker": best.symbol,
+                "quantity": qty,
+                "confidence": min(99, int(best.score + 50)),
+                "reason": f"[{mode.upper()}] {best.reason}",
+                "score": best.score,
+                "source": "strategy",
+            }
+        except Exception as e:
+            logger.warning(f"[Engine] 전략 신호 생성 실패: {e}")
+            return None
+
+    @staticmethod
+    def _merge_signals(
+        strategy: dict[str, Any] | None,
+        llm: dict[str, Any],
+    ) -> dict[str, Any]:
+        """전략 신호 + LLM 판단 통합.
+
+        SELL은 LLM 우선.
+        BUY: 전략 BUY + LLM BUY → 전략 신호 채택 (더 구체적인 지표 기반).
+        BUY: 전략 BUY + LLM HOLD → 전략 신호 채택 (기술 지표 신뢰).
+        그 외: LLM 판단 그대로.
+        """
+        if llm.get("decision") == "SELL":
+            return llm
+
+        if strategy and strategy.get("decision") == "BUY":
+            if llm.get("decision") in ("BUY", "HOLD"):
+                merged = dict(strategy)
+                merged["reason"] = (
+                    strategy.get("reason", "") + " | LLM: " + llm.get("reason", "")
+                )
+                return merged
+
+        return llm
+
+    async def _check_trailing_stops(
+        self,
+        positions: list[dict[str, Any]],
+        market_data: dict[str, Any],
+    ) -> None:
+        """트레일링 스탑: 최고가 대비 TRAILING_STOP_PCT% 하락 시 매도."""
+        for p in positions:
+            sym = p.get("symbol", "")
+            current = market_data.get(sym, {}).get("current_price", 0) or p.get("current_price", 0)
+            qty = p.get("quantity", 0)
+
+            if current <= 0 or qty <= 0:
+                continue
+
+            # 최고가 갱신
+            peak = self._trailing_stops.get(sym, current)
+            if current > peak:
+                self._trailing_stops[sym] = current
+                peak = current
+
+            # 최고가 대비 하락폭 체크
+            drawdown_pct = (peak - current) / peak * 100 if peak > 0 else 0
+            if drawdown_pct >= TRAILING_STOP_PCT:
+                reason = (
+                    f"트레일링 스탑 발동: 최고가 {peak:,.0f} → 현재 {current:,.0f} "
+                    f"(-{drawdown_pct:.1f}% >= {TRAILING_STOP_PCT}%)"
+                )
+                logger.info(f"[Engine] {sym} {reason}")
+                await self._execute(
+                    {"decision": "SELL", "ticker": sym, "quantity": qty,
+                     "confidence": 90, "reason": reason},
+                    positions,
+                    market_data,
+                )
+                self._trailing_stops.pop(sym, None)
 
     async def _check_stop_conditions(
         self,
@@ -258,8 +420,11 @@ class TradingEngine:
                 return
 
             qty = max(1, int(MAX_PER_SLOT // current_price))
-            stop_price = round(current_price * (1 - STOP_LOSS_PCT / 100), 0)
-            target_price = round(current_price * (1 + TAKE_PROFIT_PCT / 100), 0)
+            mode_cfg = TRADING_MODE_CONFIG.get(self.trading_mode, {})
+            _stop_pct = mode_cfg.get("stop_pct", STOP_LOSS_PCT)
+            _tp_pct = mode_cfg.get("take_profit_pct", TAKE_PROFIT_PCT)
+            stop_price = round(current_price * (1 - _stop_pct / 100), 0)
+            target_price = round(current_price * (1 + _tp_pct / 100), 0)
 
             try:
                 from core.broker.kis import KISBroker
@@ -276,7 +441,7 @@ class TradingEngine:
                     stop_price=stop_price,
                     target_price=target_price,
                     market="KOSPI",
-                    strategy="orlando_kim",
+                    strategy=self.trading_mode,
                 ))
 
                 from database.models import Trade
@@ -288,7 +453,7 @@ class TradingEngine:
                     price=current_price,
                     status="FILLED",
                     market="KOSPI",
-                    strategy="orlando_kim",
+                    strategy=self.trading_mode,
                 ))
 
                 from notifications.telegram_bot import notify_trade
