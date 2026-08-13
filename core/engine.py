@@ -48,12 +48,31 @@ class TradingEngine:
         self._watchlist: dict[str, str] = {}
         self._task: asyncio.Task | None = None
 
+        # 올랜도킴 기본 관심종목 (우량주 위주)
+        _DEFAULT_WATCHLIST: dict[str, str] = {
+            "005930": "삼성전자",
+            "000660": "SK하이닉스",
+            "NVDA": "NVIDIA",
+            "AVGO": "Broadcom",
+            "TSM": "TSMC",
+            "MU": "Micron",
+            "AMD": "AMD",
+            "MRVL": "Marvell",
+            "AMZN": "Amazon",
+            "MSFT": "Microsoft",
+            "GOOG": "Alphabet",
+            "TSLA": "Tesla",
+            "VRT": "Vertiv",
+            "DELL": "Dell",
+        }
+
         if DEMO_MODE:
             logger.info("[Engine] DEMO_MODE 활성화")
             from core.demo_data import get_demo_watchlist
             for item in get_demo_watchlist():
                 self._watchlist[item["ticker"]] = item["name"]
         else:
+            self._watchlist = dict(_DEFAULT_WATCHLIST)
             from core.data_fetcher import DataFetcher
             self.fetcher = DataFetcher()
 

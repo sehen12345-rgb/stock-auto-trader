@@ -16,12 +16,28 @@ DEMO_STOCKS: dict[str, dict[str, Any]] = {
     "035420": {"name": "NAVER", "market": "KR", "base_price": 198500, "week52_high": 248000},
     "051910": {"name": "LG화학", "market": "KR", "base_price": 312000, "week52_high": 420000},
     "006400": {"name": "삼성SDI", "market": "KR", "base_price": 258000, "week52_high": 380000},
-    # NASDAQ
-    "AAPL":  {"name": "Apple", "market": "US", "base_price": 227.5, "week52_high": 237.2},
+    # 올랜도킴 관심종목 — 우량주
     "NVDA":  {"name": "NVIDIA", "market": "US", "base_price": 138.9, "week52_high": 153.1},
-    "MSFT":  {"name": "Microsoft", "market": "US", "base_price": 441.2, "week52_high": 468.3},
-    "TSLA":  {"name": "Tesla", "market": "US", "base_price": 248.7, "week52_high": 358.6},
+    "AVGO":  {"name": "Broadcom", "market": "US", "base_price": 185.0, "week52_high": 242.0},
+    "TSM":   {"name": "TSMC", "market": "US", "base_price": 195.0, "week52_high": 226.0},
+    "MU":    {"name": "Micron", "market": "US", "base_price": 110.0, "week52_high": 157.5},
+    "AMD":   {"name": "AMD", "market": "US", "base_price": 165.0, "week52_high": 228.0},
+    "MRVL":  {"name": "Marvell", "market": "US", "base_price": 95.0, "week52_high": 119.0},
     "AMZN":  {"name": "Amazon", "market": "US", "base_price": 218.3, "week52_high": 242.5},
+    "MSFT":  {"name": "Microsoft", "market": "US", "base_price": 441.2, "week52_high": 495.0},
+    "GOOG":  {"name": "Alphabet", "market": "US", "base_price": 198.0, "week52_high": 208.7},
+    "ORCL":  {"name": "Oracle", "market": "US", "base_price": 178.0, "week52_high": 198.3},
+    "PANW":  {"name": "Palo Alto Networks", "market": "US", "base_price": 370.0, "week52_high": 410.0},
+    "TSLA":  {"name": "Tesla", "market": "US", "base_price": 248.7, "week52_high": 358.6},
+    "CAT":   {"name": "Caterpillar", "market": "US", "base_price": 350.0, "week52_high": 418.0},
+    "GEV":   {"name": "GE Vernova", "market": "US", "base_price": 290.0, "week52_high": 390.0},
+    "VRT":   {"name": "Vertiv", "market": "US", "base_price": 115.0, "week52_high": 149.0},
+    "DELL":  {"name": "Dell", "market": "US", "base_price": 130.0, "week52_high": 179.7},
+    "LLY":   {"name": "Eli Lilly", "market": "US", "base_price": 870.0, "week52_high": 972.0},
+    # 올랜도킴 관심종목 — 적자주식 (소량 투기)
+    "IONQ":  {"name": "IonQ", "market": "US", "base_price": 42.0, "week52_high": 54.7},
+    "RKLB":  {"name": "Rocket Lab", "market": "US", "base_price": 22.0, "week52_high": 32.0},
+    "ASTS":  {"name": "AST SpaceMobile", "market": "US", "base_price": 28.0, "week52_high": 38.5},
 }
 
 # 인스턴스별 현재가 캐시 (요청마다 ±0.5% 랜덤)
@@ -169,7 +185,7 @@ def get_demo_return_history(days: int = 30) -> list[dict[str, Any]]:
 def get_demo_watchlist() -> list[dict[str, Any]]:
     """기본 관심종목 데이터."""
     items = []
-    for ticker in ["005930", "000660", "AAPL", "NVDA", "MSFT"]:
+    for ticker in ["005930", "000660", "NVDA", "AVGO", "TSM", "MU", "AMD", "MRVL", "AMZN", "MSFT", "GOOG", "TSLA", "VRT", "DELL"]:
         data = get_demo_ticker(ticker)
         stock = DEMO_STOCKS[ticker]
         high = stock["week52_high"]

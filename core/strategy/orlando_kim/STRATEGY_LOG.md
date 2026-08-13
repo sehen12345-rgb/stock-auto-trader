@@ -43,5 +43,60 @@
 
 ---
 
+---
+
+## 2026-08-13: 관심종목 (2026 하반기 장기 유망주)
+
+### 핵심 투자 원칙
+- 분할매수 (급등 후 추격 금지, 눌림목/조정 시 매수)
+- 장기 보유 관점 (단기 변동성 무시)
+- 섹터별 대표 종목 집중
+
+### 우량주 (안정적 매수 대상)
+| 티커 | 종목명 | 매수 전략 |
+|------|--------|-----------|
+| NVDA | NVIDIA | 조정 시 분할매수 |
+| AVGO | Broadcom | 조정 시 분할매수 |
+| CAT  | Caterpillar | 눌림목 매수 |
+| TSM  | TSMC | 조정 시 분할매수 |
+| TSLA | Tesla | 조정 시 분할매수 |
+| AMZN | Amazon | 200달러 or 200일선 지지 시 매수 |
+| GOOG | Alphabet | 클라우드 실적 양호, 조정 시 매수 |
+| GEV  | GE Vernova | 에너지 섹터 |
+| CLS  | Celestica | 반도체 서플라이체인 |
+| LITE | Lumentum | 광통신/AI |
+| COHR | Coherent | 광통신/AI |
+| VRT  | Vertiv | AI 데이터센터 인프라 |
+| MU   | Micron | 메모리 반도체 |
+| AMD  | AMD | 확인된 바닥 후 진입, EPS 성장 확인 |
+| MRVL | Marvell | EPS 4.05→9.16→11.92, 매출 2배 성장 |
+| MSFT | Microsoft | 470달러 눌림목 매수 |
+| ORCL | Oracle | 소프트웨어/클라우드 |
+| PANW | Palo Alto Networks | 사이버보안 |
+| LLY  | Eli Lilly | 헬스케어 |
+| BAC  | Bank of America (또는 JPM) | 금융 섹터 |
+| DELL | Dell | 350~360달러 눌림목 매수 |
+
+### 적자주식 (투기적 고위험 소량 보유)
+| 티커 | 종목명 | 특이사항 |
+|------|--------|----------|
+| IONQ | IonQ | 양자컴퓨팅 |
+| NBIS | Nebius | AI 인프라 |
+| RKLB | Rocket Lab | 우주항공 |
+| IREN | Iris Energy | 비트코인 채굴/AI |
+| PL   | Planet Labs | 위성 데이터 |
+| ASTS | AST SpaceMobile | 위성통신 |
+| SPLX | Simplex | 주의 관찰 |
+
+### 매수 전략 요약
+- 급등 후 추격 금지, 반드시 눌림목(되돌림) 구간에서 분할매수
+- AMZN: 200달러 or 200일선 지지 확인 후 매수
+- MSFT: 470달러 눌림목 매수
+- DELL: 350~360달러 눌림목 매수
+- AMD: 바닥 확인 후 진입 (섣부른 선취매 금지)
+- 적자주식: 소량 투기적 보유, 손절 철저
+
+---
+
 ## 대기 중인 자료
 - 추가 캡쳐 수신 시 반영 예정
