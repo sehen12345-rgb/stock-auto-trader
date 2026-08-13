@@ -132,7 +132,7 @@ class TradingEngine:
                 now = datetime.now()
                 in_market = self._is_market_hours()
 
-                if DEMO_MODE or in_market:
+                if DEMO_MODE or self._is_any_market_hours():
                     await self._tick()
 
                 # 장 시작 알림 (09:00 직후 첫 틱)
@@ -160,6 +160,18 @@ class TradingEngine:
     def _is_market_hours(self) -> bool:
         now = datetime.now().time()
         return dtime(9, 0) <= now <= dtime(15, 30)
+
+    def _is_nasdaq_hours(self) -> bool:
+        """나스닥 정규장 (서머타임 자동 적용)."""
+        from zoneinfo import ZoneInfo
+        import datetime as _dt
+        now_et = _dt.datetime.now(ZoneInfo("America/New_York"))
+        market_open = now_et.replace(hour=9, minute=30, second=0, microsecond=0)
+        market_close = now_et.replace(hour=16, minute=0, second=0, microsecond=0)
+        return market_open <= now_et <= market_close
+
+    def _is_any_market_hours(self) -> bool:
+        return self._is_market_hours() or self._is_nasdaq_hours()
 
     def _reset_daily_loss_if_needed(self) -> None:
         today = datetime.now().strftime("%Y-%m-%d")
