@@ -22,8 +22,13 @@ class DataFetcher:
             return self._dummy(symbol)
 
     def _fetch_sync(self, symbol: str) -> dict[str, Any]:
-        current_price = self._broker.get_current_price(symbol)
-        df = self._broker.get_ohlcv(symbol, period=252)
+        is_overseas = self._broker._is_overseas(symbol)
+        if is_overseas:
+            current_price = self._broker.get_overseas_price(symbol)
+            df = self._broker.get_overseas_ohlcv(symbol, period=252)
+        else:
+            current_price = self._broker.get_current_price(symbol)
+            df = self._broker.get_ohlcv(symbol, period=252)
 
         closes = df["close"].tolist() if not df.empty else []
         volumes = df["volume"].tolist() if not df.empty else []

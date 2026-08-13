@@ -430,8 +430,12 @@ class TradingEngine:
                 from core.broker.kis import KISBroker
                 broker = KISBroker()
                 broker.connect()
-                order = broker.buy_market(ticker, qty)
-                logger.info(f"[Engine] 매수 주문: {ticker} {qty}주 @ {current_price:,.0f}원")
+                if broker._is_overseas(ticker):
+                    order = broker.buy_overseas_market(ticker, qty)
+                    logger.info(f"[Engine] 해외 매수: {ticker} {qty}주 @ ${current_price:.2f}")
+                else:
+                    order = broker.buy_market(ticker, qty)
+                    logger.info(f"[Engine] 매수 주문: {ticker} {qty}주 @ {current_price:,.0f}원")
 
                 from database.models import PositionRecord
                 self.position_repo.upsert(PositionRecord(
@@ -476,8 +480,12 @@ class TradingEngine:
                 from core.broker.kis import KISBroker
                 broker = KISBroker()
                 broker.connect()
-                order = broker.sell_market(ticker, qty)
-                logger.info(f"[Engine] 매도 주문: {ticker} {qty}주 @ {current_price:,.0f}원")
+                if broker._is_overseas(ticker):
+                    order = broker.sell_overseas_market(ticker, qty)
+                    logger.info(f"[Engine] 해외 매도: {ticker} {qty}주 @ ${current_price:.2f}")
+                else:
+                    order = broker.sell_market(ticker, qty)
+                    logger.info(f"[Engine] 매도 주문: {ticker} {qty}주 @ {current_price:,.0f}원")
 
                 pnl = (current_price - avg_price) * qty if current_price > 0 and avg_price > 0 else 0
                 pnl_pct = round((current_price - avg_price) / avg_price * 100, 2) if avg_price > 0 else 0

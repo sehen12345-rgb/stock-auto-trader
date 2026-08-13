@@ -53,6 +53,16 @@ class KISBroker(BaseBroker):
     TR_ORDER_LIST_REAL = "TTTC8036R"
     TR_ORDER_LIST_MOCK = "VTTC8036R"
 
+    # 해외주식 TR-ID
+    TR_OVERSEAS_PRICE = "HHDFS00000300"        # 해외주식 현재가
+    TR_OVERSEAS_OHLCV = "HHDFS76240000"        # 해외주식 일봉
+    TR_OVERSEAS_BUY_REAL = "TTTT1002U"
+    TR_OVERSEAS_BUY_MOCK = "VTTT1002U"
+    TR_OVERSEAS_SELL_REAL = "TTTT1006U"
+    TR_OVERSEAS_SELL_MOCK = "VTTT1006U"
+    TR_OVERSEAS_BALANCE_REAL = "TTTS3012R"
+    TR_OVERSEAS_BALANCE_MOCK = "VTTS3012R"
+
     def __init__(
         self,
         app_key: str = KIS_APP_KEY,
@@ -445,6 +455,122 @@ class KISBroker(BaseBroker):
                 orders.append(o)
 
         return orders
+
+    # ── 해외주식 ─────────────────────────────────────────────────────────
+
+    @staticmethod
+    def _is_overseas(symbol: str) -> bool:
+        """알파벳으로만 구성된 티커는 해외주식으로 판단."""
+        return symbol.isalpha()
+
+    @staticmethod
+    def _get_exchange(symbol: str) -> str:
+        """티커별 거래소 코드 반환. 기본 NASDAQ."""
+        nyse = {"BRK", "JPM", "BAC", "GS", "MS", "WMT", "CAT", "GE", "GEV", "LLY", "UNH"}
+        return "NYS" if symbol.upper() in nyse else "NAS"
+
+    def get_overseas_price(self, symbol: str) -> float:
+        excd = self._get_exchange(symbol)
+        url = f"{self.base_url}/uapi/overseas-price/v1/quotations/price"
+        params = {"AUTH": "", "EXCD": excd, "SYMB": symbol.upper()}
+        try:
+            resp = self._session.get(
+                url, params=params,
+                headers=self._headers(self.TR_OVERSEAS_PRICE), timeout=10
+            )
+            resp.raise_for_status()
+            data = resp.json()
+            price = float(data.get("output", {}).get("last", 0))
+            logger.debug(f"[KIS] {symbol} 해외 현재가: ${price:.2f}")
+            return price
+        except Exception as e:
+            logger.warning(f"[KIS] {symbol} 해외 시세 조회 실패: {e}")
+            return 0.0
+
+    def get_overseas_ohlcv(self, symbol: str, period: int = 60) -> pd.DataFrame:
+        excd = self._get_exchange(symbol)
+        url = f"{self.base_url}/uapi/overseas-price/v1/quotations/dailyprice"
+        today = datetime.now().strftime("%Y%m%d")
+        params = {
+            "AUTH": "", "EXCD": excd, "SYMB": symbol.upper(),
+            "GUBN": "0", "BYMD": today, "MODP": "0",
+        }
+        try:
+            resp = self._session.get(
+                url, params=params,
+                headers=self._headers(self.TR_OVERSEAS_OHLCV), timeout=10
+            )
+            resp.raise_for_status()
+            data = resp.json()
+            output2 = data.get("output2", [])
+            rows = []
+            for item in output2[:period]:
+                rows.append({
+                    "date": item.get("xymd", ""),
+                    "open": float(item.get("open", 0)),
+                    "high": float(item.get("high", 0)),
+                    "low": float(item.get("low", 0)),
+                    "close": float(item.get("clos", 0)),
+                    "volume": int(item.get("tvol", 0)),
+                })
+            df = pd.DataFrame(rows)
+            if not df.empty:
+                df["date"] = pd.to_datetime(df["date"], format="%Y%m%d")
+                df.sort_values("date", inplace=True)
+                df.set_index("date", inplace=True)
+            return df
+        except Exception as e:
+            logger.warning(f"[KIS] {symbol} 해외 OHLCV 조회 실패: {e}")
+            return pd.DataFrame()
+
+    def buy_overseas_market(self, symbol: str, quantity: int) -> Order:
+        return self._place_overseas_order(symbol, OrderSide.BUY, quantity)
+
+    def sell_overseas_market(self, symbol: str, quantity: int) -> Order:
+        return self._place_overseas_order(symbol, OrderSide.SELL, quantity)
+
+    def _place_overseas_order(self, symbol: str, side: OrderSide, quantity: int) -> Order:
+        tr_id = (self.TR_OVERSEAS_BUY_MOCK if self.mock else self.TR_OVERSEAS_BUY_REAL) \
+            if side == OrderSide.BUY \
+            else (self.TR_OVERSEAS_SELL_MOCK if self.mock else self.TR_OVERSEAS_SELL_REAL)
+        url = f"{self.base_url}/uapi/overseas-stock/v1/trading/order"
+        acc_no, acc_suffix = self._split_account()
+        excd = self._get_exchange(symbol)
+        price = self.get_overseas_price(symbol)
+        payload = {
+            "CANO": acc_no,
+            "ACNT_PRDT_CD": acc_suffix,
+            "OVRS_EXCG_CD": excd,
+            "PDNO": symbol.upper(),
+            "ORD_DVSN": "00",           # 지정가 (해외는 시장가 미지원)
+            "ORD_QTY": str(quantity),
+            "OVRS_ORD_UNPR": f"{price:.2f}",
+            "ORD_SVR_DVSN_CD": "0",
+        }
+        try:
+            resp = self._session.post(
+                url, json=payload,
+                headers=self._headers(tr_id, {"tr_cont": "N"}), timeout=10
+            )
+            resp.raise_for_status()
+            data = resp.json()
+            output = data.get("output", {})
+            order = Order(
+                symbol=symbol,
+                side=side,
+                order_type=OrderType.LIMIT,
+                quantity=quantity,
+                price=price,
+                order_id=output.get("ODNO", ""),
+                status=OrderStatus.PENDING,
+                raw=output,
+            )
+            logger.info(f"[KIS] 해외 주문: {side.value} {symbol} {quantity}주 @ ${price:.2f}")
+            return order
+        except Exception as e:
+            logger.error(f"[KIS] 해외 주문 실패 {symbol}: {e}")
+            return Order(symbol=symbol, side=side, order_type=OrderType.LIMIT,
+                         quantity=quantity, price=price, status=OrderStatus.REJECTED)
 
     # ── 유틸 ────────────────────────────────────────────────────────────
 
