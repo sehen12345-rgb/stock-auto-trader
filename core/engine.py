@@ -768,7 +768,15 @@ class TradingEngine:
                     logger.warning(f"[Engine] 매도 거부됨: {ticker} — DB 유지")
                     return
 
-                pnl = (current_price - avg_price) * sell_qty if current_price > 0 and avg_price > 0 else 0
+                gross_pnl = (current_price - avg_price) * sell_qty if current_price > 0 and avg_price > 0 else 0
+                # 수수료 + 세금 차감 (한국투자증권 실계좌 기준)
+                # 수수료: 매수/매도 각 0.015% + 유관기관 0.00396% 합산 ≈ 0.019%
+                # 증권거래세: 코스피 0.18%, 해외 0% (현지 세금은 별도)
+                _fee_rate = 0.00196  # 수수료 (편도)
+                _tax_rate = 0.0 if _is_overseas_sell else 0.0018
+                buy_fee  = avg_price * sell_qty * _fee_rate
+                sell_fee = current_price * sell_qty * (_fee_rate + _tax_rate)
+                pnl = round(gross_pnl - buy_fee - sell_fee, 0)
                 pnl_pct = round((current_price - avg_price) / avg_price * 100, 2) if avg_price > 0 else 0
                 self._daily_loss += pnl
 
