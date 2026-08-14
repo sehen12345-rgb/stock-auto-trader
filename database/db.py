@@ -101,10 +101,26 @@ CREATE TABLE IF NOT EXISTS signals (
     created_at    TEXT    NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%S', 'now'))
 );
 
+CREATE TABLE IF NOT EXISTS research_notes (
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    ticker        TEXT    NOT NULL,
+    source        TEXT    NOT NULL DEFAULT '',
+    rating        TEXT    NOT NULL DEFAULT '',
+    target_price  REAL    NOT NULL DEFAULT 0,
+    current_price REAL    NOT NULL DEFAULT 0,
+    summary       TEXT    NOT NULL DEFAULT '',
+    content       TEXT    NOT NULL DEFAULT '',
+    catalyst      TEXT    NOT NULL DEFAULT '',
+    created_at    TEXT    NOT NULL DEFAULT (datetime('now','localtime')),
+    updated_at    TEXT    NOT NULL DEFAULT (datetime('now','localtime'))
+);
+
 CREATE INDEX IF NOT EXISTS idx_trades_symbol    ON trades(symbol);
 CREATE INDEX IF NOT EXISTS idx_trades_created   ON trades(created_at);
 CREATE INDEX IF NOT EXISTS idx_signals_symbol   ON signals(symbol);
 CREATE INDEX IF NOT EXISTS idx_signals_created  ON signals(created_at);
+CREATE INDEX IF NOT EXISTS idx_research_ticker  ON research_notes(ticker);
+CREATE INDEX IF NOT EXISTS idx_research_created ON research_notes(created_at);
 """
 
 

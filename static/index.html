@@ -356,6 +356,48 @@
   .bt-stat-value { font-size: 1.05rem; font-weight: 800; }
   .bt-trades { margin-top: 12px; max-height: 200px; overflow-y: auto; }
   .bt-loading { color: var(--muted); font-size: 0.82rem; padding: 12px 0; }
+
+  /* ── 리서치 노트 ── */
+  .research-form {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 8px;
+    margin-bottom: 14px;
+  }
+  @media (max-width: 640px) { .research-form { grid-template-columns: 1fr; } }
+  .research-form input, .research-form textarea {
+    background: var(--surface2); border: 1px solid var(--border);
+    color: var(--text); border-radius: 8px; padding: 8px 12px; font-size: 0.82rem;
+    outline: none; width: 100%; resize: vertical;
+  }
+  .research-form input:focus, .research-form textarea:focus { border-color: var(--blue); }
+  .research-form textarea { grid-column: 1 / -1; min-height: 80px; }
+  .research-form .row-full { grid-column: 1 / -1; }
+  .research-submit { margin-top: 4px; }
+
+  .research-list { display: flex; flex-direction: column; gap: 10px; margin-top: 14px; }
+  .research-card {
+    background: var(--surface2); border: 1px solid var(--border);
+    border-radius: 10px; padding: 14px 16px; position: relative;
+  }
+  .research-card-header {
+    display: flex; align-items: center; gap: 8px; flex-wrap: wrap; margin-bottom: 6px;
+  }
+  .research-ticker-tag {
+    display: inline-block; padding: 2px 8px; border-radius: 6px; font-size: 0.75rem; font-weight: 800;
+    background: rgba(76,201,240,0.18); color: var(--blue);
+  }
+  .research-source { font-size: 0.75rem; color: var(--muted); }
+  .research-date   { font-size: 0.7rem; color: var(--muted); }
+  .research-rating {
+    display: inline-block; padding: 1px 7px; border-radius: 5px; font-size: 0.72rem; font-weight: 700;
+    background: rgba(0,200,150,0.15); color: var(--green);
+  }
+  .research-tp { font-size: 0.75rem; color: var(--yellow); font-weight: 700; }
+  .research-summary { font-size: 0.82rem; color: var(--text); margin-bottom: 4px; }
+  .research-catalyst { font-size: 0.75rem; color: var(--muted); }
+  .research-del { position: absolute; top: 10px; right: 12px; }
+  .research-empty { text-align: center; color: var(--muted); padding: 20px 0; font-size: 0.82rem; }
 </style>
 </head>
 <body>
@@ -513,6 +555,39 @@
       <button class="btn btn-add" onclick="runBacktest()">▶ 백테스트 실행</button>
     </div>
     <div id="bt-output"></div>
+  </div>
+
+  <!-- 리서치 노트 -->
+  <div class="panel" style="margin-bottom:16px">
+    <div class="panel-title">리서치 노트 <span id="research-count"></span></div>
+
+    <!-- 입력 폼 -->
+    <div class="research-form">
+      <input id="rn-ticker"   placeholder="종목코드 (예: NVDA, 000660)" maxlength="12">
+      <input id="rn-source"   placeholder="출처 (예: 올랜도킴, 미즈호, 골드만)" maxlength="40">
+      <input id="rn-rating"   placeholder="투자의견 (예: 매수, Outperform)" maxlength="30">
+      <input id="rn-catalyst" placeholder="촉매 (예: 실적발표, 인베스터데이)" maxlength="80">
+      <input id="rn-tp"       placeholder="목표주가 (숫자)" type="number" min="0" step="any">
+      <input id="rn-cp"       placeholder="현재가 (숫자)" type="number" min="0" step="any">
+      <input id="rn-summary"  placeholder="핵심 요약 (한 줄)" maxlength="200" class="row-full">
+      <textarea id="rn-content" placeholder="전체 내용을 붙여넣으세요..."></textarea>
+    </div>
+    <button class="btn btn-add research-submit" onclick="saveResearch()">+ 리서치 저장</button>
+
+    <!-- 필터 -->
+    <div style="display:flex;gap:8px;align-items:center;margin-top:16px;flex-wrap:wrap">
+      <input id="rn-filter" placeholder="종목코드로 필터" maxlength="12"
+        style="background:var(--surface2);border:1px solid var(--border);color:var(--text);
+               border-radius:8px;padding:6px 10px;font-size:0.8rem;outline:none;width:180px"
+        oninput="filterResearch(this.value)">
+      <button class="btn" style="background:var(--surface2);color:var(--muted);border:1px solid var(--border)"
+        onclick="$('rn-filter').value='';refreshResearch()">전체 보기</button>
+    </div>
+
+    <!-- 목록 -->
+    <div class="research-list" id="research-list">
+      <div class="research-empty">저장된 리서치 없음</div>
+    </div>
   </div>
 
   <!-- 로그 -->
@@ -975,6 +1050,7 @@ async function refreshAll() {
     refreshDecisions(),
     refreshWatchlist(),
     refreshTradingMode(),
+    refreshResearch(),
   ]);
 }
 
@@ -1166,10 +1242,99 @@ async function runBacktest() {
 }
 
 /* ════════════════════════════════════════
+   리서치 노트
+════════════════════════════════════════ */
+let _researchCache = [];
+
+async function refreshResearch(ticker = '') {
+  try {
+    const url = ticker ? `/api/research?ticker=${encodeURIComponent(ticker)}` : '/api/research';
+    _researchCache = await api(url);
+    renderResearch(_researchCache);
+  } catch(e) { addLog('리서치 조회 실패: ' + e.message, 'err'); }
+}
+
+function renderResearch(items) {
+  const list = $('research-list');
+  const cnt  = $('research-count');
+  if (cnt) cnt.textContent = items.length ? `(${items.length}건)` : '';
+  if (!items.length) {
+    list.innerHTML = '<div class="research-empty">저장된 리서치 없음</div>';
+    return;
+  }
+  list.innerHTML = items.map(n => {
+    const tp = n.target_price ? (n.target_price < 100000
+      ? `$${Number(n.target_price).toLocaleString()}`
+      : `${Number(n.target_price).toLocaleString()}원`) : '';
+    const cp = n.current_price ? (n.current_price < 100000
+      ? `$${Number(n.current_price).toLocaleString()}`
+      : `${Number(n.current_price).toLocaleString()}원`) : '';
+    const date = (n.created_at || '').slice(0, 10);
+    return `
+      <div class="research-card">
+        <button class="btn-del research-del" onclick="deleteResearch(${n.id})">✕</button>
+        <div class="research-card-header">
+          <span class="research-ticker-tag">${n.ticker}</span>
+          ${n.source ? `<span class="research-source">${n.source}</span>` : ''}
+          ${n.rating ? `<span class="research-rating">${n.rating}</span>` : ''}
+          ${tp ? `<span class="research-tp">목표 ${tp}</span>` : ''}
+          ${cp ? `<span style="font-size:.72rem;color:var(--muted)">현재 ${cp}</span>` : ''}
+          <span class="research-date">${date}</span>
+        </div>
+        ${n.summary ? `<div class="research-summary">${n.summary}</div>` : ''}
+        ${n.catalyst ? `<div class="research-catalyst">촉매: ${n.catalyst}</div>` : ''}
+        ${n.content ? `<details style="margin-top:6px">
+          <summary style="font-size:0.75rem;color:var(--muted);cursor:pointer">전체 내용 보기</summary>
+          <div style="font-size:0.78rem;color:var(--muted);margin-top:6px;white-space:pre-wrap;line-height:1.6">${n.content}</div>
+        </details>` : ''}
+      </div>`;
+  }).join('');
+}
+
+async function saveResearch() {
+  const ticker = $('rn-ticker').value.trim().toUpperCase();
+  if (!ticker) { addLog('리서치: 종목코드를 입력하세요', 'warn'); return; }
+  const body = {
+    ticker,
+    source:        $('rn-source').value.trim(),
+    rating:        $('rn-rating').value.trim(),
+    target_price:  parseFloat($('rn-tp').value) || 0,
+    current_price: parseFloat($('rn-cp').value) || 0,
+    summary:       $('rn-summary').value.trim(),
+    content:       $('rn-content').value.trim(),
+    catalyst:      $('rn-catalyst').value.trim(),
+  };
+  try {
+    await api('/api/research', 'POST', body);
+    // 폼 초기화
+    ['rn-ticker','rn-source','rn-rating','rn-catalyst','rn-tp','rn-cp','rn-summary','rn-content']
+      .forEach(id => { $(id).value = ''; });
+    addLog(`리서치 저장: ${ticker}`);
+    refreshResearch();
+  } catch(e) { addLog('리서치 저장 실패: ' + e.message, 'err'); }
+}
+
+async function deleteResearch(id) {
+  try {
+    await api(`/api/research/${id}`, 'DELETE');
+    addLog(`리서치 삭제 (id=${id})`);
+    refreshResearch();
+  } catch(e) { addLog('리서치 삭제 실패: ' + e.message, 'err'); }
+}
+
+function filterResearch(ticker) {
+  const t = ticker.trim().toUpperCase();
+  if (!t) { renderResearch(_researchCache); return; }
+  renderResearch(_researchCache.filter(n => n.ticker === t));
+}
+
+/* ════════════════════════════════════════
    초기화 추가
 ════════════════════════════════════════ */
 refreshTradingMode();
+refreshResearch();
 $('bt-ticker').addEventListener('keydown', e => { if (e.key === 'Enter') runBacktest(); });
+$('rn-ticker').addEventListener('keydown', e => { if (e.key === 'Enter') saveResearch(); });
 </script>
 </body>
 </html>

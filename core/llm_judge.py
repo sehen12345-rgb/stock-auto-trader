@@ -145,6 +145,22 @@ class LLMJudge:
         else:
             logger.info("[LLM] ANTHROPIC_API_KEY 없음 — 규칙 기반 판단 모드")
 
+    @staticmethod
+    def _fetch_research_context(tickers: list[str]) -> dict[str, list[dict]]:
+        """종목 리스트에 대한 최근 리서치 이력을 반환한다. 실패 시 빈 dict."""
+        try:
+            from database.research_repo import get_research_repo
+            repo = get_research_repo()
+            result = {}
+            for ticker in tickers:
+                notes = repo.find_by_ticker(ticker, limit=5)
+                if notes:
+                    result[ticker] = notes
+            return result
+        except Exception as e:
+            logger.warning(f"[LLM] 리서치 이력 조회 실패: {e}")
+            return {}
+
     async def judge(
         self,
         market_data: dict[str, Any],
@@ -162,10 +178,15 @@ class LLMJudge:
                         f"확신도:{result.get('confidence')}%")
             return result
 
+        # 리서치 이력 수집 (market_data 종목 + watchlist 종목)
+        all_tickers = list(market_data.keys()) + list(watchlist.keys())
+        research_map = self._fetch_research_context(list(dict.fromkeys(all_tickers)))
+
         prompt = self._build_prompt(
             market_data, positions, watchlist, trading_mode,
             fear_greed=fear_greed, kospi_change=kospi_change, nasdaq_change=nasdaq_change,
             news_context=news_context,
+            research_map=research_map,
         )
         try:
             response = self._client.messages.create(
@@ -300,6 +321,7 @@ class LLMJudge:
         kospi_change: float = 0.0,
         nasdaq_change: float = 0.0,
         news_context: dict[str, Any] | None = None,
+        research_map: dict[str, list[dict]] | None = None,
     ) -> str:
         mode_labels = {
             "scalping": "스캘핑 (손절-1%/익절+1.5%)",
@@ -430,6 +452,31 @@ class LLMJudge:
         lines.append("\n## 관심 종목")
         for t, n in watchlist.items():
             lines.append(f"- {t} ({n})")
+
+        # 리서치 이력 섹션
+        if research_map:
+            lines.append("\n## 올랜도킴 리서치 이력")
+            for ticker, notes in research_map.items():
+                lines.append(f"\n### {ticker}")
+                for note in notes:
+                    date_str = (note.get("created_at") or "")[:10]
+                    source = note.get("source", "")
+                    rating = note.get("rating", "")
+                    tp = note.get("target_price", 0)
+                    summary = note.get("summary", "")
+                    catalyst = note.get("catalyst", "")
+                    header_parts = [f"[{date_str}]"]
+                    if source:
+                        header_parts.append(source)
+                    if rating:
+                        header_parts.append(rating)
+                    if tp:
+                        header_parts.append(f"목표가 ${tp:,.0f}" if tp < 100000 else f"목표가 {tp:,.0f}원")
+                    lines.append(" | ".join(header_parts))
+                    if summary:
+                        lines.append(f"- {summary}")
+                    if catalyst:
+                        lines.append(f"- 촉매: {catalyst}")
 
         lines.append(
             f"\n현재 매매 모드는 **{mode_label}**입니다. "

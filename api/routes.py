@@ -5,6 +5,7 @@ from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
 
 from core.engine import TradingEngine
+from database.research_repo import get_research_repo
 
 router = APIRouter()
 engine = TradingEngine()
@@ -23,6 +24,17 @@ class BacktestRequest(BaseModel):
     ticker: str
     strategy: str = "long_term"  # "scalping" | "day_trading" | "swing" | "long_term"
     period_days: int = 90
+
+
+class ResearchNoteRequest(BaseModel):
+    ticker: str
+    source: str = ""
+    rating: str = ""
+    target_price: float = 0.0
+    current_price: float = 0.0
+    summary: str = ""
+    content: str = ""
+    catalyst: str = ""
 
 
 @router.get("/status")
@@ -223,3 +235,30 @@ async def run_backtest(req: BacktestRequest) -> dict[str, Any]:
     except Exception as e:
         logger.error(f"[Backtest API] 오류: {e}")
         raise HTTPException(status_code=500, detail=str(e))
+
+
+# ── 리서치 노트 ────────────────────────────────────────────────────────────
+
+@router.post("/research")
+async def save_research(req: ResearchNoteRequest) -> dict[str, Any]:
+    """리서치 노트 저장."""
+    repo = get_research_repo()
+    note_id = repo.save(req.model_dump())
+    return {"status": "saved", "id": note_id}
+
+
+@router.get("/research")
+async def list_research(ticker: str = "") -> list[dict[str, Any]]:
+    """리서치 노트 목록. ticker 쿼리 파라미터로 필터링 가능."""
+    repo = get_research_repo()
+    if ticker:
+        return repo.find_by_ticker(ticker.upper(), limit=50)
+    return repo.find_all(limit=50)
+
+
+@router.delete("/research/{note_id}")
+async def delete_research(note_id: int) -> dict[str, Any]:
+    """리서치 노트 삭제."""
+    repo = get_research_repo()
+    repo.delete(note_id)
+    return {"status": "deleted", "id": note_id}
