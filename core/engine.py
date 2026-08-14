@@ -511,11 +511,29 @@ class TradingEngine:
                 return
 
             if is_overseas:
-                # USD 기준 수량 계산 (슬롯 예산 ÷ 1380 환율 환산)
                 usd_budget = MAX_PER_SLOT / 1380
-                qty = max(1, int(usd_budget // current_price))
+                qty = int(usd_budget // current_price)
             else:
-                qty = max(1, int(MAX_PER_SLOT // current_price))
+                qty = int(MAX_PER_SLOT // current_price)
+
+            if qty <= 0:
+                logger.warning(f"[Engine] {ticker} 현재가({current_price:,.0f})가 슬롯 예산 초과, 매수 건너뜀")
+                return
+
+            # 실제 잔고 확인 후 주문 가능 여부 체크
+            try:
+                broker_check = KISBroker()
+                broker_check.connect()
+                bal = broker_check.get_balance()
+                available_cash = bal.cash if bal.cash else 0
+                required = current_price * qty
+                if available_cash < required:
+                    logger.warning(
+                        f"[Engine] {ticker} 잔고 부족 (필요: {required:,.0f}원, 가용: {available_cash:,.0f}원), 매수 건너뜀"
+                    )
+                    return
+            except Exception as e:
+                logger.warning(f"[Engine] 잔고 조회 실패 ({e}), 주문 진행")
 
             mode_cfg = TRADING_MODE_CONFIG.get(self.trading_mode, {})
             _stop_pct = mode_cfg.get("stop_pct", STOP_LOSS_PCT)
