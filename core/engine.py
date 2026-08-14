@@ -510,32 +510,45 @@ class TradingEngine:
                 logger.info(f"[Engine] {ticker} 나스닥 장 시간 아님, 매수 건너뜀")
                 return
 
-            # 실제 예수금 조회 → 슬롯 예산과 비교해 더 큰 쪽 사용
+            # 실제 예수금 조회
             available_cash = 0
             try:
                 bal = self.fetcher._broker.get_balance()
                 available_cash = bal.cash if bal.cash else 0
             except Exception as e:
                 logger.warning(f"[Engine] 잔고 조회 실패 ({e}), 슬롯 예산으로 진행")
+                available_cash = MAX_PER_SLOT
+
+            # 남은 슬롯 수로 예수금 동적 배분
+            remaining_slots = MAX_SLOTS - len(held_symbols)
+            budget_per_slot = available_cash / max(remaining_slots, 1)
 
             if is_overseas:
-                usd_budget = max(MAX_PER_SLOT, available_cash) / 1380
+                usd_budget = budget_per_slot / 1380
                 qty = int(usd_budget // current_price)
+                # 슬롯 예산 부족해도 전체 예수금으로 1주 살 수 있으면 매수
+                if qty == 0 and (available_cash / 1380) >= current_price:
+                    qty = 1
             else:
-                budget = max(MAX_PER_SLOT, available_cash)
-                qty = int(budget // current_price)
+                qty = int(budget_per_slot // current_price)
+                # 슬롯 예산 부족해도 전체 예수금으로 1주 살 수 있으면 매수
+                if qty == 0 and available_cash >= current_price:
+                    qty = 1
 
             if qty <= 0:
                 logger.warning(
-                    f"[Engine] {ticker} 현재가({current_price:,.0f})가 예수금({available_cash:,.0f}원) 초과, 매수 건너뜀"
+                    f"[Engine] {ticker} 매수 불가 — 예수금 {available_cash:,.0f}원 < 현재가 {current_price:,.0f}원"
                 )
                 return
 
+            # 실제 필요금액이 예수금 초과하면 수량 줄이기
             if available_cash > 0 and available_cash < current_price * qty:
-                logger.warning(
-                    f"[Engine] {ticker} 잔고 부족 (필요: {current_price*qty:,.0f}원, 가용: {available_cash:,.0f}원), 매수 건너뜀"
-                )
-                return
+                qty = int(available_cash // current_price)
+                if qty <= 0:
+                    logger.warning(
+                        f"[Engine] {ticker} 잔고 부족 (가용: {available_cash:,.0f}원, 필요: {current_price:,.0f}원)"
+                    )
+                    return
 
             mode_cfg = TRADING_MODE_CONFIG.get(self.trading_mode, {})
             _stop_pct = mode_cfg.get("stop_pct", STOP_LOSS_PCT)
