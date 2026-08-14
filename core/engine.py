@@ -572,6 +572,7 @@ class TradingEngine:
                     order_type="MARKET",
                     quantity=qty,
                     price=current_price,
+                    order_id=order.order_id,
                     status="FILLED",
                     market="KOSPI",
                     strategy=self.trading_mode,
@@ -598,11 +599,16 @@ class TradingEngine:
                 broker = KISBroker()
                 broker.connect()
                 if _is_overseas_sell:
-                    broker.sell_overseas_market(ticker, qty)
+                    sell_order = broker.sell_overseas_market(ticker, qty)
                     logger.info(f"[Engine] 해외 매도: {ticker} {qty}주 @ ${current_price:.2f}")
                 else:
-                    broker.sell_market(ticker, qty)
+                    sell_order = broker.sell_market(ticker, qty)
                     logger.info(f"[Engine] 매도 주문: {ticker} {qty}주 @ {current_price:,.0f}원")
+
+                from core.broker.kis import OrderStatus as KOrderStatus
+                if sell_order.status == KOrderStatus.REJECTED:
+                    logger.warning(f"[Engine] 매도 거부됨: {ticker} — DB 유지")
+                    return
 
                 pnl = (current_price - avg_price) * qty if current_price > 0 and avg_price > 0 else 0
                 pnl_pct = round((current_price - avg_price) / avg_price * 100, 2) if avg_price > 0 else 0
@@ -617,6 +623,7 @@ class TradingEngine:
                     order_type="MARKET",
                     quantity=qty,
                     price=current_price,
+                    order_id=sell_order.order_id,
                     status="FILLED",
                     market="KOSPI",
                     strategy="orlando_kim",
