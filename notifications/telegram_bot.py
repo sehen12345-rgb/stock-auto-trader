@@ -415,14 +415,18 @@ async def notify_nasdaq_open(positions: list[dict]) -> None:
 
 
 async def run_polling() -> None:
+    import asyncio as _asyncio
     app = _get_app()
     if app is None:
         logger.info("[Telegram] 토큰 없음, polling 생략")
         return
-    try:
-        await app.initialize()
-        await app.start()
-        await app.updater.start_polling()
-        logger.info("[Telegram] polling 시작")
-    except Exception as e:
-        logger.warning(f"[Telegram] polling 시작 실패: {e}")
+    for attempt in range(5):
+        try:
+            await app.initialize()
+            await app.start()
+            await app.updater.start_polling(drop_pending_updates=True)
+            logger.info("[Telegram] polling 시작")
+            return
+        except Exception as e:
+            logger.warning(f"[Telegram] polling 시작 실패 (시도 {attempt+1}/5): {e}")
+            await _asyncio.sleep(10 * (attempt + 1))
