@@ -19,6 +19,9 @@ from core.indicators import (
 _OHLCV_CACHE: dict[str, tuple[pd.DataFrame, float]] = {}
 _OHLCV_TTL = 1800  # OHLCV 30분 캐시 (지표는 자주 바뀌지 않음)
 
+_POSITIONS_CACHE: tuple[list, float] | None = None
+_POSITIONS_TTL = 60  # KIS 포지션 1분 캐시 (레이트 리밋 방지)
+
 
 class DataFetcher:
     def __init__(self) -> None:
@@ -216,6 +219,10 @@ class DataFetcher:
             }
 
     async def fetch_kis_positions(self) -> list[dict[str, Any]]:
+        global _POSITIONS_CACHE
+        now = time.time()
+        if _POSITIONS_CACHE and (now - _POSITIONS_CACHE[1]) < _POSITIONS_TTL:
+            return _POSITIONS_CACHE[0]
         try:
             positions = self._broker.get_positions()
             result = []
@@ -234,10 +241,11 @@ class DataFetcher:
                     "stop_price": round(p.avg_price * 0.965, 0),
                     "target_price": round(p.avg_price * 1.06, 0),
                 })
+            _POSITIONS_CACHE = (result, now)
             return result
         except Exception as e:
             logger.warning(f"[Fetcher] KIS 포지션 조회 실패: {e}")
-            return []
+            return _POSITIONS_CACHE[0] if _POSITIONS_CACHE else []
 
     @staticmethod
     def _dummy(symbol: str) -> dict[str, Any]:

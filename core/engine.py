@@ -522,9 +522,7 @@ class TradingEngine:
 
             # 실제 잔고 확인 후 주문 가능 여부 체크
             try:
-                broker_check = KISBroker()
-                broker_check.connect()
-                bal = broker_check.get_balance()
+                bal = self.fetcher._broker.get_balance()
                 available_cash = bal.cash if bal.cash else 0
                 required = current_price * qty
                 if available_cash < required:
