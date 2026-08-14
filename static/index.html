@@ -398,6 +398,45 @@
   .research-catalyst { font-size: 0.75rem; color: var(--muted); }
   .research-del { position: absolute; top: 10px; right: 12px; }
   .research-empty { text-align: center; color: var(--muted); padding: 20px 0; font-size: 0.82rem; }
+
+  /* ── 매매 일지 ── */
+  .journal-day {
+    background: var(--surface2); border: 1px solid var(--border);
+    border-radius: 12px; margin-bottom: 12px; overflow: hidden;
+  }
+  .journal-day-header {
+    display: flex; align-items: center; gap: 12px; padding: 12px 16px;
+    cursor: pointer; user-select: none;
+    border-bottom: 1px solid var(--border);
+  }
+  .journal-day-header:hover { background: rgba(255,255,255,0.03); }
+  .journal-date { font-size: 0.9rem; font-weight: 700; color: var(--text); min-width: 90px; }
+  .journal-pnl { font-size: 1rem; font-weight: 800; min-width: 90px; }
+  .journal-pnl.pos { color: var(--green); }
+  .journal-pnl.neg { color: var(--red); }
+  .journal-pnl.zero { color: var(--muted); }
+  .journal-meta { font-size: 0.75rem; color: var(--muted); display: flex; gap: 10px; }
+  .journal-toggle { margin-left: auto; font-size: 0.75rem; color: var(--muted); }
+  .journal-trades { padding: 10px 16px 14px; }
+  .journal-trade-row {
+    display: flex; align-items: center; gap: 10px; padding: 6px 0;
+    border-bottom: 1px solid rgba(255,255,255,0.05); font-size: 0.8rem;
+  }
+  .journal-trade-row:last-child { border-bottom: none; }
+  .j-side { font-weight: 700; min-width: 36px; }
+  .j-side.buy { color: var(--green); }
+  .j-side.sell { color: var(--red); }
+  .j-sym { font-weight: 700; color: var(--blue); min-width: 60px; }
+  .j-qty { color: var(--muted); min-width: 50px; }
+  .j-price { color: var(--text); min-width: 80px; }
+  .j-pnl { font-weight: 700; min-width: 70px; }
+  .j-pnl.pos { color: var(--green); }
+  .j-pnl.neg { color: var(--red); }
+  .j-time { color: var(--muted); margin-left: auto; }
+  .j-status { font-size: 0.68rem; padding: 1px 6px; border-radius: 4px; }
+  .j-status.filled { background: rgba(0,200,150,0.15); color: var(--green); }
+  .j-status.rejected { background: rgba(255,71,87,0.15); color: var(--red); }
+  .journal-empty { text-align: center; color: var(--muted); padding: 30px 0; font-size: 0.85rem; }
 </style>
 </head>
 <body>
@@ -587,6 +626,19 @@
     <!-- 목록 -->
     <div class="research-list" id="research-list">
       <div class="research-empty">저장된 리서치 없음</div>
+    </div>
+  </div>
+
+  <!-- 매매 일지 -->
+  <div class="panel" style="margin-bottom:16px">
+    <div class="panel-title">매매 일지 <span id="journal-range" style="font-size:0.75rem;color:var(--muted);font-weight:400">최근 30일</span></div>
+    <div style="display:flex;gap:8px;margin-bottom:14px;flex-wrap:wrap">
+      <button class="btn" style="background:var(--surface2);color:var(--muted);border:1px solid var(--border);font-size:0.78rem" onclick="refreshJournal(7)">7일</button>
+      <button class="btn" style="background:var(--surface2);color:var(--muted);border:1px solid var(--border);font-size:0.78rem" onclick="refreshJournal(30)">30일</button>
+      <button class="btn" style="background:var(--surface2);color:var(--muted);border:1px solid var(--border);font-size:0.78rem" onclick="refreshJournal(90)">90일</button>
+    </div>
+    <div id="journal-wrap">
+      <div class="journal-empty">아직 매매 기록이 없습니다</div>
     </div>
   </div>
 
@@ -1333,6 +1385,75 @@ function filterResearch(ticker) {
 ════════════════════════════════════════ */
 refreshTradingMode();
 refreshResearch();
+refreshJournal(30);
+
+/* ════════════════════════════════════════
+   매매 일지
+════════════════════════════════════════ */
+async function refreshJournal(days = 30) {
+  $('journal-range').textContent = `최근 ${days}일`;
+  try {
+    const data = await api(`/api/journal?days=${days}`);
+    renderJournal(data);
+  } catch(e) { addLog('일지 조회 실패: ' + e.message, 'err'); }
+}
+
+function renderJournal(data) {
+  const wrap = $('journal-wrap');
+  if (!data || !data.length) {
+    wrap.innerHTML = '<div class="journal-empty">아직 매매 기록이 없습니다</div>';
+    return;
+  }
+  wrap.innerHTML = data.map(day => {
+    const pnlClass = day.pnl > 0 ? 'pos' : day.pnl < 0 ? 'neg' : 'zero';
+    const pnlSign  = day.pnl > 0 ? '+' : '';
+    const pnlStr   = day.pnl !== 0 ? `${pnlSign}${day.pnl.toLocaleString()}원` : '0원';
+    const dayId    = 'jd-' + day.date.replace(/-/g,'');
+
+    const tradesHtml = day.trades.map(t => {
+      const sideClass = t.side === 'BUY' ? 'buy' : 'sell';
+      const sideLabel = t.side === 'BUY' ? '매수' : '매도';
+      const pnlHtml   = t.side === 'SELL' && t.pnl !== 0
+        ? `<span class="j-pnl ${t.pnl>0?'pos':'neg'}">${t.pnl>0?'+':''}${t.pnl.toLocaleString()}원</span>`
+        : '<span class="j-pnl" style="color:var(--muted)">-</span>';
+      const stCls = t.status === 'FILLED' ? 'filled' : 'rejected';
+      const stLbl = t.status === 'FILLED' ? '체결' : '거부';
+      return `
+        <div class="journal-trade-row">
+          <span class="j-side ${sideClass}">${sideLabel}</span>
+          <span class="j-sym">${stockName(t.symbol)}</span>
+          <span class="j-qty">${t.quantity}주</span>
+          <span class="j-price">${t.price > 0 ? t.price.toLocaleString() : '-'}</span>
+          ${pnlHtml}
+          <span class="j-status ${stCls}">${stLbl}</span>
+          <span class="j-time">${t.time}</span>
+        </div>`;
+    }).join('');
+
+    return `
+      <div class="journal-day">
+        <div class="journal-day-header" onclick="toggleJournal('${dayId}')">
+          <span class="journal-date">${day.date}</span>
+          <span class="journal-pnl ${pnlClass}">${pnlStr}</span>
+          <div class="journal-meta">
+            <span>매수 ${day.buy_count}건</span>
+            <span>매도 ${day.sell_count}건</span>
+            ${day.sell_count > 0 ? `<span>승률 ${day.win_rate}%</span>` : ''}
+          </div>
+          <span class="journal-toggle">▼</span>
+        </div>
+        <div class="journal-trades" id="${dayId}" style="display:none">
+          ${tradesHtml || '<div style="color:var(--muted);font-size:0.8rem">거래 없음</div>'}
+        </div>
+      </div>`;
+  }).join('');
+}
+
+function toggleJournal(id) {
+  const el = $(id);
+  if (!el) return;
+  el.style.display = el.style.display === 'none' ? 'block' : 'none';
+}
 $('bt-ticker').addEventListener('keydown', e => { if (e.key === 'Enter') runBacktest(); });
 $('rn-ticker').addEventListener('keydown', e => { if (e.key === 'Enter') saveResearch(); });
 </script>

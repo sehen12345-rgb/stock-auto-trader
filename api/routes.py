@@ -310,3 +310,56 @@ async def parse_research(req: ResearchParseRequest) -> dict[str, Any]:
         return parsed
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
+
+# ── 매매 일지 ──────────────────────────────────────────────────────────────────
+
+@router.get("/journal")
+async def get_journal(days: int = 30) -> list[dict[str, Any]]:
+    """최근 N일 매매 일지 (날짜별 요약)."""
+    from database.models import TradeRepository
+    from database.db import get_db
+    import datetime as _dt
+
+    repo = TradeRepository(get_db())
+    result = []
+    today = _dt.date.today()
+
+    for i in range(days):
+        d = today - _dt.timedelta(days=i)
+        date_str = d.strftime("%Y-%m-%d")
+        trades = repo.find_by_date(date_str)
+        if not trades:
+            continue
+
+        buys   = [t for t in trades if t.side == "BUY"  and t.status == "FILLED"]
+        sells  = [t for t in trades if t.side == "SELL" and t.status == "FILLED"]
+        daily_pnl = sum(t.pnl for t in sells)
+        wins   = [t for t in sells if t.pnl > 0]
+        losses = [t for t in sells if t.pnl < 0]
+
+        trade_list = []
+        for t in sorted(trades, key=lambda x: x.created_at):
+            trade_list.append({
+                "id": t.id,
+                "symbol": t.symbol,
+                "side": t.side,
+                "quantity": t.quantity,
+                "price": t.filled_price or t.price,
+                "pnl": round(t.pnl, 0),
+                "status": t.status,
+                "time": t.created_at[11:16],
+            })
+
+        result.append({
+            "date": date_str,
+            "pnl": round(daily_pnl, 0),
+            "buy_count": len(buys),
+            "sell_count": len(sells),
+            "win_count": len(wins),
+            "loss_count": len(losses),
+            "win_rate": round(len(wins) / len(sells) * 100, 1) if sells else 0,
+            "trades": trade_list,
+        })
+
+    return result

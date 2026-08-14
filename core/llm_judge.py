@@ -135,6 +135,7 @@ _ANTHROPIC_API_KEY: str = os.getenv("ANTHROPIC_API_KEY", "")
 class LLMJudge:
     def __init__(self) -> None:
         self._client = None
+        self._last_signal_hash: str = ""  # 신호 변화 없으면 LLM 호출 스킵
         if _ANTHROPIC_API_KEY:
             try:
                 import anthropic
@@ -178,7 +179,27 @@ class LLMJudge:
                         f"확신도:{result.get('confidence')}%")
             return result
 
-        # 리서치 이력 수집 (market_data 종목 + watchlist 종목)
+        # 신호 해시 — RSI/MACD/pullback 등 핵심 지표 변화 없으면 LLM 스킵
+        import hashlib
+        signal_key = json.dumps({
+            t: {
+                "rsi": round(d.get("rsi") or 0, 0),
+                # macd_hist: 1자리 반올림으로 노이즈 억제 (macd_hist 없으면 macd 사용)
+                "macd": round((d.get("macd_hist") or d.get("macd") or 0) * 10) / 10,
+                "pullback": d.get("pullback_detected"),
+                "above_ma20": d.get("above_ma20"),
+                "volume_surge": d.get("volume_surge"),
+            }
+            for t, d in market_data.items()
+        }, sort_keys=True) + str([p.get("symbol") for p in positions])
+        signal_hash = hashlib.md5(signal_key.encode()).hexdigest()
+
+        if signal_hash == self._last_signal_hash:
+            logger.debug("[LLM] 신호 변화 없음 — API 호출 스킵")
+            return {"decision": "HOLD", "ticker": "", "quantity": 0, "confidence": 0, "reason": "신호 변화 없음, 관망"}
+        self._last_signal_hash = signal_hash
+
+        # 리서치 이력 수집
         all_tickers = list(market_data.keys()) + list(watchlist.keys())
         research_map = self._fetch_research_context(list(dict.fromkeys(all_tickers)))
 
@@ -190,9 +211,13 @@ class LLMJudge:
         )
         try:
             response = self._client.messages.create(
-                model="claude-sonnet-4-6",
-                max_tokens=512,
-                system=SYSTEM_PROMPT,
+                model="claude-haiku-4-5-20251001",
+                max_tokens=256,
+                system=[{
+                    "type": "text",
+                    "text": SYSTEM_PROMPT,
+                    "cache_control": {"type": "ephemeral"},
+                }],
                 messages=[{"role": "user", "content": prompt}],
             )
             text = response.content[0].text.strip()
@@ -294,7 +319,7 @@ class LLMJudge:
 
         if best_ticker and best_confidence >= 55:
             price = market_data[best_ticker].get("current_price", 0)
-            qty = max(1, int(2_500_000 // price)) if price > 0 else 1
+            qty = 1  # 엔진이 예수금 기반으로 재계산
             return {
                 "decision": "BUY",
                 "ticker": best_ticker,

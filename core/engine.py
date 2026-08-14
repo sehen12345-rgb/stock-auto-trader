@@ -62,10 +62,12 @@ class TradingEngine:
         self._watchlist: dict[str, str] = {}
         self._task: asyncio.Task | None = None
 
-        # 매매 모드
-        self.trading_mode: str = "long_term"
+        # 매매 모드 (환경변수로 영속화)
+        self.trading_mode: str = os.getenv("TRADING_MODE", "day_trading")
         # 트레일링 스탑: {symbol: 최고가}
         self._trailing_stops: dict[str, float] = {}
+        # 분할매도 1차 완료: {symbol: 1차매도가}
+        self._partial_sold: dict[str, float] = {}
 
         # 시장 필터 캐시
         self._fear_greed_cache: dict[str, Any] = {}
@@ -150,6 +152,10 @@ class TradingEngine:
                         self._market_open_notified = False
                         asyncio.create_task(_safe(self._notify_market_close()))
 
+                # 15:20 안전망 — 익절/손절 못한 코스피 포지션 강제 청산
+                if not DEMO_MODE and dtime(15, 20) <= now.time() <= dtime(15, 25):
+                    await self._close_kospi_before_nasdaq()
+
                 # 나스닥 장 시작 알림
                 if not DEMO_MODE and self._is_nasdaq_hours() and not self._nasdaq_open_notified:
                     self._nasdaq_open_notified = True
@@ -169,6 +175,24 @@ class TradingEngine:
             except Exception as e:
                 logger.error(f"[Engine] 루프 에러: {e}")
                 await asyncio.sleep(10)
+
+    async def _close_kospi_before_nasdaq(self) -> None:
+        """15:20 코스피 포지션 전량 청산 — 나스닥 자금 확보."""
+        positions = await self.get_positions()
+        from core.broker.kis import KISBroker
+        for p in positions:
+            sym = p.get("symbol", "")
+            if KISBroker._is_overseas(sym):
+                continue
+            if p.get("quantity", 0) <= 0:
+                continue
+            logger.info(f"[Engine] 장마감 전 코스피 청산: {sym}")
+            await self._execute(
+                {"decision": "SELL", "ticker": sym, "quantity": p["quantity"],
+                 "confidence": 95, "reason": "장마감 전 코스피 청산 — 나스닥 자금 확보"},
+                positions,
+                {sym: {"current_price": p.get("current_price", 0)}},
+            )
 
     def _is_market_hours(self) -> bool:
         now = datetime.now().time()
@@ -329,10 +353,44 @@ class TradingEngine:
         if mode not in TRADING_MODE_CONFIG:
             raise ValueError(f"지원하지 않는 모드: {mode}. 허용: {list(TRADING_MODE_CONFIG.keys())}")
         self.trading_mode = mode
+        # .env에 저장해서 재시작해도 유지
+        _env_path = os.path.join(os.path.dirname(__file__), "..", ".env")
+        try:
+            with open(_env_path, "r", encoding="utf-8") as f:
+                lines = f.readlines()
+            found = False
+            for i, line in enumerate(lines):
+                if line.startswith("TRADING_MODE="):
+                    lines[i] = f"TRADING_MODE={mode}\n"
+                    found = True
+            if not found:
+                lines.append(f"TRADING_MODE={mode}\n")
+            with open(_env_path, "w", encoding="utf-8") as f:
+                f.writelines(lines)
+        except Exception as e:
+            logger.warning(f"[Engine] TRADING_MODE .env 저장 실패: {e}")
         cfg = TRADING_MODE_CONFIG[mode]
+        stop_pct = cfg["stop_pct"]
+        tp_pct = cfg["take_profit_pct"]
+        # 기존 포지션 목표가/손절가 재계산
+        try:
+            positions = self.position_repo.find_all()
+            for p in positions:
+                from core.broker.kis import KISBroker
+                is_os = KISBroker._is_overseas(p.symbol)
+                dec = 2 if is_os else 0
+                new_stop = round(p.avg_price * (1 - stop_pct / 100), dec)
+                new_tp = round(p.avg_price * (1 + tp_pct / 100), dec)
+                self.position_repo.db.execute(
+                    "UPDATE positions SET stop_price=?, target_price=? WHERE symbol=?",
+                    (new_stop, new_tp, p.symbol)
+                )
+            logger.info(f"[Engine] 모드 변경 → 포지션 {len(positions)}개 목표가 재계산 완료")
+        except Exception as e:
+            logger.warning(f"[Engine] 포지션 목표가 재계산 실패: {e}")
         logger.info(f"[Engine] 매매 모드 변경: {mode} "
                     f"(tick={cfg['tick_interval']}s, "
-                    f"stop={cfg['stop_pct']}%, tp={cfg['take_profit_pct']}%)")
+                    f"stop={stop_pct}%, tp={tp_pct}%)")
 
     def _generate_strategy_signal(
         self,
@@ -398,8 +456,12 @@ class TradingEngine:
         BUY: 전략 BUY + LLM HOLD → 전략 신호 채택 (기술 지표 신뢰).
         그 외: LLM 판단 그대로.
         """
+        # LLM SELL은 무시 — _check_stop_conditions가 손절/익절을 전담
         if llm.get("decision") == "SELL":
-            return llm
+            return {
+                "decision": "HOLD", "ticker": llm.get("ticker", ""), "quantity": 0,
+                "confidence": 0, "reason": f"[LLM SELL 무시 — 자동 손절/익절 위임] {llm.get('reason', '')}",
+            }
 
         if strategy and strategy.get("decision") == "BUY":
             if llm.get("decision") in ("BUY", "HOLD"):
@@ -452,16 +514,44 @@ class TradingEngine:
         positions: list[dict[str, Any]],
         market_data: dict[str, Any],
     ) -> None:
+        from core.broker.kis import KISBroker as _KIS
         for p in positions:
             sym = p.get("symbol", "")
             current = market_data.get(sym, {}).get("current_price", 0) or p.get("current_price", 0)
             stop = p.get("stop_price", 0)
             target = p.get("target_price", 0)
+            avg = p.get("avg_price", 0)
             qty = p.get("quantity", 0)
 
-            if current <= 0 or qty <= 0:
+            if current <= 0 or qty <= 0 or avg <= 0:
                 continue
 
+            pnl_pct = (current - avg) / avg * 100
+
+            # ── 단타 분할매도 ──────────────────────────────
+            # 1차 익절: +2%(KOSPI) 또는 +4%(해외) 도달 시 50% 매도
+            # 이후 나머지는 트레일링 스탑 -1%로 관리
+            if self.trading_mode == "day_trading" and sym not in self._partial_sold:
+                is_os = _KIS._is_overseas(sym)
+                first_tp = 4.0 if is_os else 2.0
+                if pnl_pct >= first_tp and qty >= 2:
+                    half = qty // 2
+                    reason = (
+                        f"분할매도 1차: +{pnl_pct:.1f}% 도달 → {half}주 익절, "
+                        f"나머지 {qty - half}주 트레일링 스탑 관리"
+                    )
+                    logger.info(f"[Engine] {sym} {reason}")
+                    self._partial_sold[sym] = current  # 1차 매도 완료 표시
+                    # 트레일링 스탑을 현재가 기준으로 재설정
+                    self._trailing_stops[sym] = current
+                    await self._execute(
+                        {"decision": "SELL", "ticker": sym, "quantity": half,
+                         "confidence": 90, "reason": reason},
+                        positions, market_data,
+                    )
+                    continue
+
+            # ── 손절 / 전량 익절 ───────────────────────────
             reason = ""
             if stop > 0 and current <= stop:
                 reason = f"손절가 도달 ({current:,.0f} <= {stop:,.0f})"
@@ -469,12 +559,13 @@ class TradingEngine:
                 reason = f"익절가 도달 ({current:,.0f} >= {target:,.0f})"
 
             if reason:
-                logger.info(f"[Engine] {sym} {reason} → 자동 매도")
+                logger.info(f"[Engine] {sym} {reason} → 전량 매도")
+                self._partial_sold.pop(sym, None)
+                self._trailing_stops.pop(sym, None)
                 await self._execute(
                     {"decision": "SELL", "ticker": sym, "quantity": qty,
                      "confidence": 95, "reason": reason},
-                    positions,
-                    market_data,
+                    positions, market_data,
                 )
 
     async def _execute(
@@ -529,8 +620,10 @@ class TradingEngine:
                 bal = self.fetcher._broker.get_balance()
                 available_cash = bal.cash if bal.cash else 0
             except Exception as e:
-                logger.warning(f"[Engine] 잔고 조회 실패 ({e}), 슬롯 예산으로 진행")
-                available_cash = MAX_PER_SLOT
+                logger.warning(f"[Engine] 잔고 조회 실패 ({e}), 시드 기준 추정")
+                # 폴백: 시드 - 현재 포지션 평가액 추정
+                invested = sum(p.get("value", 0) for p in positions)
+                available_cash = max(0, SEED_AMOUNT - invested)
 
             # 남은 슬롯 수로 예수금 동적 배분
             remaining_slots = MAX_SLOTS - len(held_symbols)
@@ -566,6 +659,12 @@ class TradingEngine:
             mode_cfg = TRADING_MODE_CONFIG.get(self.trading_mode, {})
             _stop_pct = mode_cfg.get("stop_pct", STOP_LOSS_PCT)
             _tp_pct = mode_cfg.get("take_profit_pct", TAKE_PROFIT_PCT)
+            # 단타 모드: 코스피는 빠른 회전 (-1.5%/+2%), 나스닥은 변동성 여유 (-2%/+4%)
+            if self.trading_mode == "day_trading":
+                if is_overseas:
+                    _stop_pct, _tp_pct = 2.0, 4.0
+                else:
+                    _stop_pct, _tp_pct = 1.5, 2.0
             stop_price = round(current_price * (1 - _stop_pct / 100), 2 if is_overseas else 0)
             target_price = round(current_price * (1 + _tp_pct / 100), 2 if is_overseas else 0)
 
@@ -616,12 +715,16 @@ class TradingEngine:
                 logger.error(f"[Engine] 매수 실패 {ticker}: {e}")
 
         elif action == "SELL":
+            from core.broker.kis import KISBroker
             pos = next((p for p in positions if p.get("symbol") == ticker), None)
             if pos is None:
                 logger.warning(f"[Engine] 미보유 종목 SELL 시도: {ticker}")
                 return
 
-            qty = pos.get("quantity", 0)
+            full_qty = pos.get("quantity", 0)
+            # decision에 수량 지정 시 분할매도, 없으면 전량
+            sell_qty = decision.get("quantity") or full_qty
+            sell_qty = min(sell_qty, full_qty)
             avg_price = pos.get("avg_price", 0)
 
             _is_overseas_sell = KISBroker._is_overseas(ticker)
@@ -629,40 +732,52 @@ class TradingEngine:
                 broker = KISBroker()
                 broker.connect()
                 if _is_overseas_sell:
-                    sell_order = broker.sell_overseas_market(ticker, qty)
-                    logger.info(f"[Engine] 해외 매도: {ticker} {qty}주 @ ${current_price:.2f}")
+                    sell_order = broker.sell_overseas_market(ticker, sell_qty)
+                    logger.info(f"[Engine] 해외 매도: {ticker} {sell_qty}주 @ ${current_price:.2f}")
                 else:
-                    sell_order = broker.sell_market(ticker, qty)
-                    logger.info(f"[Engine] 매도 주문: {ticker} {qty}주 @ {current_price:,.0f}원")
+                    sell_order = broker.sell_market(ticker, sell_qty)
+                    logger.info(f"[Engine] 매도 주문: {ticker} {sell_qty}주 @ {current_price:,.0f}원")
 
                 from core.broker.kis import OrderStatus as KOrderStatus
                 if sell_order.status == KOrderStatus.REJECTED:
                     logger.warning(f"[Engine] 매도 거부됨: {ticker} — DB 유지")
                     return
 
-                pnl = (current_price - avg_price) * qty if current_price > 0 and avg_price > 0 else 0
+                pnl = (current_price - avg_price) * sell_qty if current_price > 0 and avg_price > 0 else 0
                 pnl_pct = round((current_price - avg_price) / avg_price * 100, 2) if avg_price > 0 else 0
                 self._daily_loss += pnl
 
-                self.position_repo.delete(ticker)
+                remaining = full_qty - sell_qty
+                if remaining > 0:
+                    # 분할매도 — 남은 수량으로 포지션 업데이트
+                    from database.models import PositionRecord
+                    self.position_repo.upsert(PositionRecord(
+                        symbol=ticker, quantity=remaining, avg_price=avg_price,
+                        stop_price=pos.get("stop_price", 0),
+                        target_price=pos.get("target_price", 0),
+                        market=pos.get("market", ""), strategy=self.trading_mode,
+                    ))
+                else:
+                    self.position_repo.delete(ticker)
+                    self._partial_sold.pop(ticker, None)
 
                 from database.models import Trade
                 self.trade_repo.save(Trade(
                     symbol=ticker,
                     side="SELL",
                     order_type="MARKET",
-                    quantity=qty,
+                    quantity=sell_qty,
                     price=current_price,
                     order_id=sell_order.order_id,
                     status="FILLED",
                     market="KOSPI",
-                    strategy="orlando_kim",
+                    strategy=self.trading_mode,
                     pnl=pnl,
                 ))
 
                 from notifications.telegram_bot import notify_trade
                 asyncio.create_task(_safe(notify_trade(
-                    "SELL", ticker, qty, current_price, 0, 0, reason, pnl_pct=pnl_pct
+                    "SELL", ticker, sell_qty, current_price, 0, 0, reason, pnl_pct=pnl_pct
                 )))
             except Exception as e:
                 logger.error(f"[Engine] 매도 실패 {ticker}: {e}")
@@ -683,10 +798,28 @@ class TradingEngine:
             from core.demo_data import get_demo_positions
             return get_demo_positions()
 
-        # KIS 잔고 우선, 500 오류 시 DB 폴백
+        # KIS 잔고 우선, DB의 stop/target으로 덮어쓰기
         try:
+            from core.broker.kis import KISBroker as _KIS
             kis_positions = await self.fetcher.fetch_kis_positions()
             if kis_positions:
+                cfg = TRADING_MODE_CONFIG.get(self.trading_mode, {})
+                base_stop = cfg.get("stop_pct", STOP_LOSS_PCT)
+                base_tp = cfg.get("take_profit_pct", TAKE_PROFIT_PCT)
+                for p in kis_positions:
+                    avg = p.get("avg_price", 0)
+                    if avg <= 0:
+                        continue
+                    sym = p.get("symbol", "")
+                    overseas = _KIS._is_overseas(sym)
+                    if self.trading_mode == "day_trading":
+                        stop_pct = 2.0 if overseas else 1.5
+                        tp_pct   = 4.0 if overseas else 2.0
+                    else:
+                        stop_pct, tp_pct = base_stop, base_tp
+                    dec = 2 if overseas else 0
+                    p["stop_price"]   = round(avg * (1 - stop_pct / 100), dec)
+                    p["target_price"] = round(avg * (1 + tp_pct  / 100), dec)
                 return kis_positions
         except Exception as e:
             logger.warning(f"[Engine] KIS 포지션 조회 실패, DB 폴백: {e}")

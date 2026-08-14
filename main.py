@@ -21,5 +21,12 @@ app.include_router(ws_router)
 app.mount("/", StaticFiles(directory="static", html=True), name="static")
 
 
+@app.on_event("startup")
+async def auto_start_bot():
+    from api.routes import engine
+    if not engine.running:
+        await engine.start()
+
+
 if __name__ == "__main__":
     uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=False)

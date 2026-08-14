@@ -49,7 +49,22 @@ class DataFetcher:
             return df
         except Exception as e:
             logger.debug(f"[Fetcher] {symbol} OHLCV 조회 실패, 캐시 사용: {e}")
-            return cached[0] if cached else pd.DataFrame()
+            if cached:
+                return cached[0]
+            # KIS 실패 시 yfinance 백업
+            if is_overseas:
+                try:
+                    import yfinance as yf
+                    ticker_yf = symbol if not symbol.isdigit() else f"{symbol}.KS"
+                    df_yf = yf.download(ticker_yf, period="1y", progress=False, auto_adjust=True)
+                    if not df_yf.empty:
+                        df_yf.columns = [c.lower() for c in df_yf.columns]
+                        _OHLCV_CACHE[symbol] = (df_yf, now)
+                        logger.debug(f"[Fetcher] {symbol} yfinance 백업 성공 ({len(df_yf)}봉)")
+                        return df_yf
+                except Exception as e2:
+                    logger.debug(f"[Fetcher] {symbol} yfinance 백업 실패: {e2}")
+            return pd.DataFrame()
 
     def _fetch_sync(self, symbol: str) -> dict[str, Any]:
         is_overseas = self._broker._is_overseas(symbol)
