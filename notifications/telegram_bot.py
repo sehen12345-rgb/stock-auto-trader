@@ -264,6 +264,21 @@ async def cmd_watchlist(update: Any, context: Any) -> None:
         await update.message.reply_text(f"오류: {e}")
 
 
+async def notify_nasdaq_open(positions: list[dict]) -> None:
+    now = datetime.now().strftime("%H:%M")
+    lines = [
+        f"🌙 <b>나스닥 장 시작</b> ({now})",
+        "NVDA / SNDK / AMZN 등 해외 종목 모니터링 시작.",
+        f"보유종목: {len(positions)}개 / 4",
+    ]
+    if positions:
+        for p in positions:
+            pnl = p.get("pnl_pct", 0)
+            sign = "+" if pnl >= 0 else ""
+            lines.append(f"  · {p['symbol']} {p['quantity']}주 ({sign}{pnl:.1f}%)")
+    await _send("\n".join(lines))
+
+
 async def run_polling() -> None:
     app = _get_app()
     if app is None:

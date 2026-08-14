@@ -12,12 +12,12 @@ from database.db import get_db
 from database.models import PositionRepository, TradeRepository
 
 DEMO_MODE: bool = os.getenv("DEMO_MODE", "false").lower() == "true"
-SEED_AMOUNT: int = int(os.getenv("SEED_AMOUNT", "1000000"))
-MAX_SLOTS: int = 2                              # 최대 2종목
+SEED_AMOUNT: int = int(os.getenv("SEED_AMOUNT", "2000000"))
+MAX_SLOTS: int = 4                              # 최대 4종목 동시 보유
 MAX_PER_SLOT: int = SEED_AMOUNT // MAX_SLOTS   # 종목당 50만원
 STOP_LOSS_PCT: float = 3.5
 TAKE_PROFIT_PCT: float = 6.0
-MAX_DAILY_LOSS: int = SEED_AMOUNT // 33        # 일 손실 한도 ~3만원
+MAX_DAILY_LOSS: int = SEED_AMOUNT // 20        # 일 손실 한도 ~10만원
 
 # 매매 모드별 설정
 TRADING_MODE_CONFIG: dict[str, dict[str, Any]] = {
@@ -53,6 +53,8 @@ class TradingEngine:
         self.llm_call_count = 0
         self._market_open_notified = False
         self._market_close_notified = False
+        self._nasdaq_open_notified = False
+        self._nasdaq_close_notified = False
         self._daily_loss: float = 0.0
         self._daily_loss_date: str = ""
 
@@ -147,6 +149,17 @@ class TradingEngine:
                         self._market_close_notified = True
                         self._market_open_notified = False
                         asyncio.create_task(_safe(self._notify_market_close()))
+
+                # 나스닥 장 시작 알림
+                if not DEMO_MODE and self._is_nasdaq_hours() and not self._nasdaq_open_notified:
+                    self._nasdaq_open_notified = True
+                    self._nasdaq_close_notified = False
+                    from notifications.telegram_bot import notify_nasdaq_open
+                    asyncio.create_task(_safe(notify_nasdaq_open(await self.get_positions())))
+
+                # 나스닥 장 종료 리셋
+                if not DEMO_MODE and not self._is_nasdaq_hours() and self._nasdaq_open_notified:
+                    self._nasdaq_open_notified = False
 
                 # 모드별 tick interval
                 interval = TRADING_MODE_CONFIG.get(self.trading_mode, {}).get("tick_interval", 30)

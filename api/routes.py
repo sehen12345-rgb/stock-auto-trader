@@ -262,3 +262,51 @@ async def delete_research(note_id: int) -> dict[str, Any]:
     repo = get_research_repo()
     repo.delete(note_id)
     return {"status": "deleted", "id": note_id}
+
+
+class ResearchParseRequest(BaseModel):
+    ticker: str
+    raw_text: str
+
+@router.post("/research/parse")
+async def parse_research(req: ResearchParseRequest) -> dict[str, Any]:
+    """원문 리서치 텍스트를 Claude가 파싱해서 구조화된 형태로 반환."""
+    import os
+    api_key = os.getenv("ANTHROPIC_API_KEY", "")
+    if not api_key:
+        raise HTTPException(status_code=400, detail="ANTHROPIC_API_KEY 없음")
+    try:
+        import anthropic
+        client = anthropic.Anthropic(api_key=api_key)
+        response = client.messages.create(
+            model="claude-haiku-4-5-20251001",
+            max_tokens=1024,
+            messages=[{
+                "role": "user",
+                "content": f"""다음 리서치 텍스트를 파싱해서 JSON으로 반환하세요. 종목코드: {req.ticker}
+
+텍스트:
+{req.raw_text}
+
+반드시 아래 JSON 형식만 반환 (설명 없이):
+{{
+  "source": "증권사/애널리스트명",
+  "rating": "Buy/Outperform/Hold 등",
+  "target_price": 숫자(없으면 0),
+  "current_price": 숫자(없으면 0),
+  "summary": "핵심 요약 2-3문장",
+  "catalyst": "주요 촉매/이벤트"
+}}"""
+            }]
+        )
+        text = response.content[0].text.strip()
+        if text.startswith("```"):
+            text = text.split("```")[1]
+            if text.startswith("json"):
+                text = text[4:]
+        import json
+        parsed = json.loads(text)
+        parsed["ticker"] = req.ticker.upper()
+        return parsed
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
