@@ -90,14 +90,41 @@
   /* ── 레이아웃 ── */
   .container { max-width: 1440px; margin: 0 auto; padding: 20px 24px; }
 
-  /* ── 반환율 바 ── */
+  /* ── 포트폴리오 요약 바 ── */
+  .pf-bar {
+    display: grid;
+    grid-template-columns: repeat(6, 1fr);
+    gap: 10px;
+    margin-bottom: 20px;
+  }
+  @media (max-width: 960px) { .pf-bar { grid-template-columns: repeat(3, 1fr); } }
+  @media (max-width: 540px) { .pf-bar { grid-template-columns: repeat(2, 1fr); } }
+
+  .pf-chip {
+    background: var(--surface); border: 1px solid var(--border);
+    border-radius: 10px; padding: 12px 14px;
+    display: flex; flex-direction: column; gap: 3px;
+    position: relative;
+  }
+  .pf-chip.highlight { border-color: rgba(0,200,150,0.4); }
+  .pf-chip.highlight-red { border-color: rgba(255,71,87,0.4); }
+  .pf-label { font-size: 0.65rem; color: var(--muted); text-transform: uppercase; letter-spacing: 0.06em; }
+  .pf-value { font-size: 1.05rem; font-weight: 800; letter-spacing: -0.01em; }
+  .pf-sub   { font-size: 0.65rem; color: var(--muted); margin-top: 1px; }
+  .pf-api-err {
+    position: absolute; top: 6px; right: 8px;
+    font-size: 0.58rem; color: var(--yellow); font-weight: 700;
+    background: rgba(255,209,102,0.12); padding: 1px 5px; border-radius: 4px;
+  }
+
+  /* ── 시장 바 ── */
   .market-bar {
-    display: flex; gap: 12px; flex-wrap: wrap; margin-bottom: 20px;
+    display: flex; gap: 10px; flex-wrap: wrap; margin-bottom: 16px;
   }
   .mchip {
     background: var(--surface); border: 1px solid var(--border);
     border-radius: 10px; padding: 10px 16px;
-    display: flex; flex-direction: column; gap: 2px; flex: 1; min-width: 140px;
+    display: flex; flex-direction: column; gap: 2px; flex: 1; min-width: 130px;
   }
   .mchip-label { font-size: 0.68rem; color: var(--muted); text-transform: uppercase; letter-spacing: 0.06em; }
   .mchip-value { font-size: 1.05rem; font-weight: 700; }
@@ -373,51 +400,58 @@
     <span id="mode-info" style="font-size:.72rem;color:var(--muted);margin-left:8px"></span>
   </div>
 
-  <!-- 시장 수익률 바 -->
-  <div class="market-bar">
-    <div class="mchip">
-      <div class="mchip-label">총 수익률</div>
-      <div class="mchip-value" id="total-return">-</div>
+  <!-- 포트폴리오 요약 바 (6칸) -->
+  <div class="pf-bar" id="pf-bar">
+    <div class="pf-chip highlight">
+      <div class="pf-label">총평가액</div>
+      <div class="pf-value" id="pf-total">-</div>
+      <div class="pf-sub" id="pf-total-sub">-</div>
+      <span class="pf-api-err" id="pf-api-err" style="display:none">API오류</span>
     </div>
-    <div class="mchip">
-      <div class="mchip-label">국장 (KOSPI)</div>
-      <div class="mchip-value" id="kr-return">-</div>
+    <div class="pf-chip">
+      <div class="pf-label">원금 (시드)</div>
+      <div class="pf-value" id="pf-seed">-</div>
+      <div class="pf-sub">투자 원금</div>
     </div>
-    <div class="mchip">
-      <div class="mchip-label">미장 (NASDAQ)</div>
-      <div class="mchip-value" id="us-return">+0.00%</div>
+    <div class="pf-chip">
+      <div class="pf-label">현금 (예수금)</div>
+      <div class="pf-value" id="pf-cash">-</div>
+      <div class="pf-sub" id="pf-cash-pct">-</div>
     </div>
-    <div class="mchip">
-      <div class="mchip-label">총평가액</div>
-      <div class="mchip-value" id="header-total">-</div>
+    <div class="pf-chip">
+      <div class="pf-label">투자금 (평가)</div>
+      <div class="pf-value" id="pf-invested">-</div>
+      <div class="pf-sub" id="pf-invested-pct">-</div>
     </div>
-    <div class="mchip">
-      <div class="mchip-label">현금</div>
-      <div class="mchip-value neutral" id="header-cash">-</div>
+    <div class="pf-chip" id="pf-pnl-chip">
+      <div class="pf-label">평가 손익</div>
+      <div class="pf-value" id="pf-pnl">-</div>
+      <div class="pf-sub" id="pf-pnl-pct">-</div>
+    </div>
+    <div class="pf-chip">
+      <div class="pf-label">보유종목 / LLM</div>
+      <div class="pf-value" id="pf-slots">0 / 2</div>
+      <div class="pf-sub" id="pf-llm-sub">판단 0회</div>
     </div>
   </div>
 
-  <!-- 요약 카드 4개 -->
-  <div class="cards">
-    <div class="card">
-      <div class="card-label">총평가액</div>
-      <div class="card-value" id="card-total">-</div>
-      <div class="card-sub" id="card-pnl">-</div>
+  <!-- 시장 지수 바 -->
+  <div class="market-bar">
+    <div class="mchip">
+      <div class="mchip-label">KOSPI 등락</div>
+      <div class="mchip-value" id="kr-return">-</div>
     </div>
-    <div class="card">
-      <div class="card-label">현금 (예수금)</div>
-      <div class="card-value" id="card-cash">-</div>
-      <div class="card-sub" id="card-cash-pct">-</div>
+    <div class="mchip">
+      <div class="mchip-label">NASDAQ 등락</div>
+      <div class="mchip-value" id="us-return">-</div>
     </div>
-    <div class="card">
-      <div class="card-label">보유종목</div>
-      <div class="card-value" id="card-positions">0 / 4</div>
-      <div class="card-sub">최대 4종목 동시 보유</div>
+    <div class="mchip">
+      <div class="mchip-label">마지막 틱</div>
+      <div class="mchip-value" id="last-tick-time" style="font-size:.85rem">-</div>
     </div>
-    <div class="card">
-      <div class="card-label">LLM 호출 수</div>
-      <div class="card-value" id="card-llm">0</div>
-      <div class="card-sub">오늘 총 판단 횟수</div>
+    <div class="mchip">
+      <div class="mchip-label">데이터 갱신</div>
+      <div class="mchip-value" id="updated-time2" style="font-size:.85rem">-</div>
     </div>
   </div>
 
@@ -568,8 +602,11 @@ async function refreshStatus() {
     cb.textContent = s.running ? '킬스위치' : '봇 시작';
     cb.className = 'btn ' + (s.running ? 'btn-kill' : 'btn-start');
 
-    $('card-llm').textContent = s.llm_call_count;
-    $('updated-time').textContent = new Date().toLocaleTimeString('ko-KR');
+    if ($('pf-llm-sub')) $('pf-llm-sub').textContent = '판단 ' + (s.llm_call_count || 0) + '회';
+    if ($('updated-time')) $('updated-time').textContent = new Date().toLocaleTimeString('ko-KR');
+    if ($('last-tick-time') && s.last_tick) {
+      $('last-tick-time').textContent = s.last_tick.slice(11, 19);
+    }
 
     // 장 시간 배지
     const mb2 = $('market-badge');
@@ -587,30 +624,50 @@ async function refreshStatus() {
 async function refreshPortfolio() {
   try {
     const pf = await api('/api/portfolio');
-    const ret = pf.return_pct;
-    const retStr = fmtPct(ret);
-    const cls = pctClass(ret);
+    const seed        = pf.seed || 2000000;
+    const totalValue  = pf.total_value || seed;
+    const cash        = pf.cash || 0;
+    const invested    = pf.invested != null ? pf.invested : Math.max(0, totalValue - cash);
+    const pnlAmt      = pf.pnl_amount != null ? pf.pnl_amount : (totalValue - seed);
+    const ret         = pf.return_pct ?? 0;
+    const retStr      = fmtPct(ret);
+    const cls         = pctClass(ret);
+    const apiErr      = pf.api_error === true;
 
-    $('total-return').textContent = retStr;
-    $('total-return').className = 'mchip-value ' + cls;
-    $('kr-return').textContent = retStr;
-    $('kr-return').className = 'mchip-value ' + cls;
+    // API 오류 표시
+    const errEl = $('pf-api-err');
+    if (errEl) errEl.style.display = apiErr ? 'block' : 'none';
 
-    $('header-total').textContent = fmt(pf.total_value) + '원';
-    $('header-cash').textContent  = fmt(pf.cash) + '원';
-    $('card-total').textContent   = fmt(pf.total_value);
-    $('card-cash').textContent    = fmt(pf.cash);
+    // 총평가액
+    $('pf-total').textContent = fmt(totalValue) + '원';
+    $('pf-total').className = 'pf-value ' + cls;
+    $('pf-total-sub').textContent = retStr + ' (' + (pnlAmt >= 0 ? '+' : '') + fmt(pnlAmt) + '원)';
+    $('pf-total-sub').className = 'pf-sub ' + cls;
 
-    // 수익금 sub
-    const seed = pf.seed || 10000000;
-    const pnl  = (pf.total_value || seed) - seed;
-    const pnlEl = $('card-pnl');
-    pnlEl.textContent = (pnl >= 0 ? '+' : '') + fmt(pnl) + '원 (' + retStr + ')';
-    pnlEl.className = 'card-sub ' + cls;
+    // 원금
+    $('pf-seed').textContent = fmt(seed) + '원';
 
-    // 현금 비율
-    const cashPct = seed > 0 ? Math.round((pf.cash / seed) * 100) : 0;
-    $('card-cash-pct').textContent = '시드 대비 ' + cashPct + '%';
+    // 현금
+    $('pf-cash').textContent = fmt(cash) + '원';
+    const cashPct = seed > 0 ? Math.round(cash / seed * 100) : 0;
+    $('pf-cash-pct').textContent = '시드 대비 ' + cashPct + '%';
+
+    // 투자금 (주식 평가)
+    $('pf-invested').textContent = fmt(invested) + '원';
+    const invPct = seed > 0 ? Math.round(invested / seed * 100) : 0;
+    $('pf-invested-pct').textContent = '시드 대비 ' + invPct + '%';
+
+    // 평가 손익
+    $('pf-pnl').textContent = (pnlAmt >= 0 ? '+' : '') + fmt(pnlAmt) + '원';
+    $('pf-pnl').className = 'pf-value ' + cls;
+    $('pf-pnl-pct').textContent = retStr;
+    $('pf-pnl-pct').className = 'pf-sub ' + cls;
+    $('pf-pnl-chip').className = 'pf-chip' + (ret >= 0 ? ' highlight' : ' highlight-red');
+
+    // 갱신 시간
+    const now = new Date().toLocaleTimeString('ko-KR');
+    if ($('updated-time')) $('updated-time').textContent = now;
+    if ($('updated-time2')) $('updated-time2').textContent = now;
   } catch(e) { addLog('포트폴리오 조회 실패: ' + e.message, 'err'); }
 }
 
@@ -682,7 +739,7 @@ async function refreshChart() {
 async function refreshPositions() {
   try {
     const pos = await api('/api/positions');
-    $('card-positions').textContent = pos.length + ' / 4';
+    if ($('pf-slots')) $('pf-slots').textContent = pos.length + ' / 2';
     $('pos-count').textContent = pos.length ? `(${pos.length}건)` : '';
     const wrap = $('positions-wrap');
     if (!pos.length) {
@@ -907,8 +964,8 @@ refreshChart();
 initWebSocket();
 refreshAll();
 
-// 30초마다 자동 갱신
-setInterval(refreshAll, 30000);
+// 15초마다 자동 갱신 (포트폴리오/포지션 실시간 반영)
+setInterval(refreshAll, 15000);
 // 차트는 5분마다
 setInterval(refreshChart, 300000);
 

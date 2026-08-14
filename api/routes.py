@@ -45,10 +45,13 @@ async def get_status() -> dict[str, Any]:
 
 @router.get("/portfolio")
 async def get_portfolio() -> dict[str, Any]:
+    import os
+    seed = int(os.getenv("SEED_AMOUNT", "2000000"))
     try:
         return await engine.get_portfolio()
     except Exception:
-        return {"total_value": 0, "cash": 0, "return_pct": 0.0, "seed": 10_000_000}
+        return {"total_value": seed, "cash": seed, "invested": 0,
+                "pnl_amount": 0, "return_pct": 0.0, "seed": seed, "api_error": True}
 
 
 @router.get("/positions")

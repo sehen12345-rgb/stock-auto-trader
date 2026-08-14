@@ -185,22 +185,35 @@ class DataFetcher:
             return pd.DataFrame()
 
     async def fetch_portfolio(self) -> dict[str, Any]:
+        import os
+        seed = int(os.getenv("SEED_AMOUNT", "2000000"))
         try:
             balance = self._broker.get_balance()
-            positions = self._broker.get_positions()
-            seed = 10_000_000
             total_value = balance.total_equity if balance.total_equity > 0 else seed
             cash = balance.cash
-            pnl_pct = round((total_value - seed) / seed * 100, 2) if seed > 0 else 0.0
+            invested = max(0.0, total_value - cash)
+            pnl_amount = total_value - seed
+            pnl_pct = round(pnl_amount / seed * 100, 2) if seed > 0 else 0.0
             return {
                 "total_value": total_value,
                 "cash": cash,
+                "invested": round(invested, 0),
+                "pnl_amount": round(pnl_amount, 0),
                 "return_pct": pnl_pct,
                 "seed": seed,
+                "api_error": False,
             }
         except Exception as e:
             logger.warning(f"[Fetcher] 포트폴리오 조회 실패: {e}")
-            return {"total_value": 0, "cash": 0, "return_pct": 0.0, "seed": 10_000_000}
+            return {
+                "total_value": seed,
+                "cash": seed,
+                "invested": 0,
+                "pnl_amount": 0,
+                "return_pct": 0.0,
+                "seed": seed,
+                "api_error": True,
+            }
 
     async def fetch_kis_positions(self) -> list[dict[str, Any]]:
         try:
