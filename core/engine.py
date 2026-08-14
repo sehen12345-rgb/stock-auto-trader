@@ -621,6 +621,11 @@ class TradingEngine:
         current_price = market_data.get(ticker, {}).get("current_price", 0)
 
         if action == "BUY":
+            # 확신도 70% 미만이면 매수 차단 (매매 품질 향상)
+            confidence = decision.get("confidence", 0)
+            if confidence < 70:
+                logger.info(f"[Engine] {ticker} 확신도 부족 ({confidence}% < 70%), 매수 건너뜀")
+                return
             if ticker in held_symbols:
                 logger.info(f"[Engine] 이미 보유 중: {ticker}")
                 return
