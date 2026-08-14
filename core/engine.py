@@ -57,6 +57,7 @@ class TradingEngine:
         self._nasdaq_close_notified = False
         self._daily_loss: float = 0.0
         self._daily_loss_date: str = ""
+        self._daily_liquidation_done: bool = False  # 14:00 전체 청산 플래그
 
         self._decisions: list[dict[str, Any]] = []
         self._watchlist: dict[str, str] = {}
@@ -152,6 +153,16 @@ class TradingEngine:
                         self._market_open_notified = False
                         asyncio.create_task(_safe(self._notify_market_close()))
 
+                # 14:00 전체 청산 — 데스크탑 종료 전 나스닥 자금 확보
+                if not DEMO_MODE and dtime(14, 0) <= now.time() <= dtime(14, 5):
+                    if not self._daily_liquidation_done:
+                        self._daily_liquidation_done = True
+                        await self._close_all_positions("14:00 자동 청산 — 저녁 나스닥 자금 확보")
+
+                # 자정 지나면 청산 플래그 리셋
+                if now.time() < dtime(9, 0):
+                    self._daily_liquidation_done = False
+
                 # 15:20 안전망 — 익절/손절 못한 코스피 포지션 강제 청산
                 if not DEMO_MODE and dtime(15, 20) <= now.time() <= dtime(15, 25):
                     await self._close_kospi_before_nasdaq()
@@ -175,6 +186,30 @@ class TradingEngine:
             except Exception as e:
                 logger.error(f"[Engine] 루프 에러: {e}")
                 await asyncio.sleep(10)
+
+    async def _close_all_positions(self, reason: str = "전체 청산") -> None:
+        """보유 중인 모든 포지션 전량 청산."""
+        positions = await self.get_positions()
+        if not positions:
+            logger.info("[Engine] 청산할 포지션 없음")
+            return
+        logger.info(f"[Engine] 전체 청산 시작: {len(positions)}종목 — {reason}")
+        for p in positions:
+            sym = p.get("symbol", "")
+            qty = p.get("quantity", 0)
+            if qty <= 0:
+                continue
+            await self._execute(
+                {"decision": "SELL", "ticker": sym, "quantity": qty,
+                 "confidence": 99, "reason": reason},
+                positions,
+                {sym: {"current_price": p.get("current_price", 0)}},
+            )
+        from notifications.telegram_bot import _send
+        asyncio.create_task(_safe(_send(
+            f"🔔 <b>14:00 자동 전체 청산 완료</b>\n"
+            f"{len(positions)}종목 매도 → 나스닥 자금 확보"
+        )))
 
     async def _close_kospi_before_nasdaq(self) -> None:
         """15:20 코스피 포지션 전량 청산 — 나스닥 자금 확보."""
