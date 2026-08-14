@@ -106,6 +106,18 @@ async def stop_bot() -> dict[str, str]:
     return {"status": "stopped"}
 
 
+@router.post("/liquidate")
+async def liquidate_all() -> dict[str, Any]:
+    """보유 포지션 전량 즉시 청산 + 봇 중지."""
+    positions = await engine.get_positions()
+    await engine._close_all_positions("수동 전체 청산 요청")
+    if engine.running:
+        await engine.stop()
+    return {"status": "ok", "count": len(positions),
+            "symbols": [p.get("symbol") for p in positions],
+            "bot_stopped": True}
+
+
 @router.post("/watchlist")
 async def add_watchlist(req: WatchlistAddRequest) -> dict[str, str]:
     engine.add_to_watchlist(req.ticker, req.name)

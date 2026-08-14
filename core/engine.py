@@ -153,16 +153,6 @@ class TradingEngine:
                         self._market_open_notified = False
                         asyncio.create_task(_safe(self._notify_market_close()))
 
-                # 14:00 전체 청산 — 데스크탑 종료 전 나스닥 자금 확보
-                if not DEMO_MODE and dtime(14, 0) <= now.time() <= dtime(14, 5):
-                    if not self._daily_liquidation_done:
-                        self._daily_liquidation_done = True
-                        await self._close_all_positions("14:00 자동 청산 — 저녁 나스닥 자금 확보")
-
-                # 자정 지나면 청산 플래그 리셋
-                if now.time() < dtime(9, 0):
-                    self._daily_liquidation_done = False
-
                 # 15:20 안전망 — 익절/손절 못한 코스피 포지션 강제 청산
                 if not DEMO_MODE and dtime(15, 20) <= now.time() <= dtime(15, 25):
                     await self._close_kospi_before_nasdaq()
