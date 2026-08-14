@@ -527,6 +527,28 @@
 
 <script>
 /* ════════════════════════════════════════
+   종목명 매핑
+════════════════════════════════════════ */
+const STOCK_NAMES = {
+  // KOSPI
+  '005930': '삼성전자', '000660': 'SK하이닉스', '035420': 'NAVER',
+  '035720': '카카오', '005380': '현대차', '000270': '기아',
+  '051910': 'LG화학', '006400': '삼성SDI', '028260': '삼성물산',
+  '105560': 'KB금융', '055550': '신한지주', '086790': '하나금융지주',
+  '032830': '삼성생명', '003550': 'LG', '034730': 'SK',
+  '017670': 'SK텔레콤', '030200': 'KT', '096770': 'SK이노베이션',
+  '010130': '고려아연', '003490': '대한항공',
+  // NASDAQ / NYSE
+  'NVDA': 'NVIDIA', 'AAPL': 'Apple', 'MSFT': 'Microsoft',
+  'AMZN': 'Amazon', 'GOOG': 'Alphabet', 'META': 'Meta',
+  'TSLA': 'Tesla', 'AMD': 'AMD', 'AVGO': 'Broadcom',
+  'MU': 'Micron', 'MRVL': 'Marvell', 'TSM': 'TSMC',
+  'DELL': 'Dell', 'VRT': 'Vertiv', 'AMAT': 'Applied Materials',
+  'ASML': 'ASML',
+};
+const stockName = sym => STOCK_NAMES[sym] || sym;
+
+/* ════════════════════════════════════════
    헬퍼
 ════════════════════════════════════════ */
 const $ = id => document.getElementById(id);
@@ -759,7 +781,7 @@ async function refreshPositions() {
               ? '<span class="ts-badge">TS 활성</span>'
               : (p.oco_active ? '<span class="oco">OCO</span>' : '-');
             return `<tr>
-              <td><b>${p.symbol}</b><br><span style="font-size:.7rem;color:var(--muted)">${p.name||''}</span></td>
+              <td><b>${p.symbol}</b><br><span style="font-size:.7rem;color:var(--muted)">${p.name || stockName(p.symbol)}</span></td>
               <td>${fmt(p.quantity)}주</td>
               <td>${fmt(p.avg_price)}</td>
               <td>${fmt(p.current_price)}</td>
@@ -797,7 +819,7 @@ async function refreshDecisions() {
           <div class="llm-top">
             <span class="llm-time">${ts(d.timestamp)}</span>
             <span class="db ${cls}">${dec}</span>
-            ${d.ticker ? `<span class="llm-ticker">${d.ticker}</span>` : ''}
+            ${d.ticker ? `<span class="llm-ticker">${d.ticker}</span><span style="font-size:.72rem;color:var(--muted);margin-left:4px">${stockName(d.ticker)}</span>` : ''}
             <span style="font-size:.72rem;color:var(--muted)">확신도 ${conf}%</span>
             ${reason.length > 60 ? `<button class="btn-reason" onclick="showReason(${i})">전체 보기</button>` : ''}
           </div>
@@ -856,7 +878,7 @@ async function refreshWatchlist() {
         <div class="wl-card">
           <button class="btn-del wl-del" onclick="delWatchlist('${item.ticker}')">✕</button>
           <div class="wl-ticker">${item.ticker} ${maBadge}</div>
-          <div class="wl-name">${item.name || ''}</div>
+          <div class="wl-name">${item.name || stockName(item.ticker)}</div>
           <div class="wl-price">${item.current_price != null ? fmt(item.current_price) + '원' : '-'}</div>
           ${distText ? `<div class="wl-dist ${distCls}">${distText}</div>` : ''}
           ${volText}
