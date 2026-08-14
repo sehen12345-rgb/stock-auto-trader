@@ -346,7 +346,23 @@ class KISBroker(BaseBroker):
         )
         resp.raise_for_status()
         data = resp.json()
+        rt_cd = data.get("rt_cd", "9")
         output = data.get("output", {})
+        order_id = output.get("ODNO", "")
+
+        if rt_cd != "0" or not order_id:
+            msg = data.get("msg1", "") or data.get("msg_cd", "")
+            logger.warning(f"[KIS] 주문 거부됨: {side.value} {symbol} rt_cd={rt_cd} msg={msg}")
+            return Order(
+                symbol=symbol,
+                side=side,
+                order_type=order_type,
+                quantity=quantity,
+                price=price,
+                order_id="",
+                status=OrderStatus.REJECTED,
+                raw=data,
+            )
 
         order = Order(
             symbol=symbol,
@@ -354,7 +370,7 @@ class KISBroker(BaseBroker):
             order_type=order_type,
             quantity=quantity,
             price=price,
-            order_id=output.get("ODNO", ""),
+            order_id=order_id,
             status=OrderStatus.PENDING,
             raw=output,
         )
@@ -559,14 +575,21 @@ class KISBroker(BaseBroker):
             )
             resp.raise_for_status()
             data = resp.json()
+            rt_cd = data.get("rt_cd", "9")
             output = data.get("output", {})
+            order_id = output.get("ODNO", "")
+            if rt_cd != "0" or not order_id:
+                msg = data.get("msg1", "") or data.get("msg_cd", "")
+                logger.warning(f"[KIS] 해외 주문 거부됨: {side.value} {symbol} rt_cd={rt_cd} msg={msg}")
+                return Order(symbol=symbol, side=side, order_type=OrderType.LIMIT,
+                             quantity=quantity, price=price, status=OrderStatus.REJECTED, raw=data)
             order = Order(
                 symbol=symbol,
                 side=side,
                 order_type=OrderType.LIMIT,
                 quantity=quantity,
                 price=price,
-                order_id=output.get("ODNO", ""),
+                order_id=order_id,
                 status=OrderStatus.PENDING,
                 raw=output,
             )
