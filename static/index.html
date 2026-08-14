@@ -1078,6 +1078,8 @@ function initWebSocket() {
       if (msg.type === 'decision') {
         refreshDecisions();
         addLog(`LLM 판단: ${msg.data?.decision} ${msg.data?.ticker || ''}`);
+        // 매도 체결 시 일지 즉시 갱신
+        if (msg.data?.decision === 'SELL') refreshJournal(_journalDays);
       }
       if (msg.type === 'position') refreshPositions();
       if (msg.type === 'portfolio') refreshPortfolio();
@@ -1103,6 +1105,7 @@ async function refreshAll() {
     refreshWatchlist(),
     refreshTradingMode(),
     refreshResearch(),
+    refreshJournal(_journalDays),
   ]);
 }
 
@@ -1390,7 +1393,9 @@ refreshJournal(30);
 /* ════════════════════════════════════════
    매매 일지
 ════════════════════════════════════════ */
-async function refreshJournal(days = 30) {
+let _journalDays = 30;
+async function refreshJournal(days = _journalDays) {
+  _journalDays = days;
   $('journal-range').textContent = `최근 ${days}일`;
   try {
     const data = await api(`/api/journal?days=${days}`);
