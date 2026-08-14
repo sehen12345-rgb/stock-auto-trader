@@ -185,15 +185,20 @@ class KISBroker(BaseBroker):
         return price
 
     def get_ohlcv(self, symbol: str, period: int = 60) -> pd.DataFrame:
+        from datetime import datetime, timedelta
+        today = datetime.now().strftime("%Y%m%d")
+        start = (datetime.now() - timedelta(days=period * 2)).strftime("%Y%m%d")
         url = f"{self.base_url}/uapi/domestic-stock/v1/quotations/inquire-daily-price"
         params = {
             "FID_COND_MRKT_DIV_CODE": "J",
             "FID_INPUT_ISCD": symbol,
             "FID_PERIOD_DIV_CODE": "D",
             "FID_ORG_ADJ_PRC": "0",
+            "FID_INPUT_DATE_1": start,
+            "FID_INPUT_DATE_2": today,
         }
         resp = self._session.get(
-            url, params=params, headers=self._headers(self.TR_PRICE), timeout=10
+            url, params=params, headers=self._headers(self.TR_OHLCV), timeout=10
         )
         resp.raise_for_status()
         data = resp.json()

@@ -12,12 +12,12 @@ from database.db import get_db
 from database.models import PositionRepository, TradeRepository
 
 DEMO_MODE: bool = os.getenv("DEMO_MODE", "false").lower() == "true"
-SEED_AMOUNT: int = 10_000_000  # 시드 1000만원
-MAX_SLOTS: int = 4
-MAX_PER_SLOT: int = 2_500_000  # 종목당 250만원
+SEED_AMOUNT: int = int(os.getenv("SEED_AMOUNT", "1000000"))
+MAX_SLOTS: int = 2                              # 최대 2종목
+MAX_PER_SLOT: int = SEED_AMOUNT // MAX_SLOTS   # 종목당 50만원
 STOP_LOSS_PCT: float = 3.5
 TAKE_PROFIT_PCT: float = 6.0
-MAX_DAILY_LOSS: int = 300_000  # 일 손실 한도 30만원
+MAX_DAILY_LOSS: int = SEED_AMOUNT // 33        # 일 손실 한도 ~3만원
 
 # 매매 모드별 설정
 TRADING_MODE_CONFIG: dict[str, dict[str, Any]] = {
@@ -221,6 +221,7 @@ class TradingEngine:
         fear_greed: dict[str, Any] = {"value": 50, "rating": "Neutral"}
         kospi_change: float = 0.0
         nasdaq_change: float = 0.0
+        news_context: dict[str, Any] = {}
         if not DEMO_MODE:
             try:
                 from core.market_filter import get_fear_greed_index, get_kospi_change, get_nasdaq_change, is_market_bullish
@@ -237,6 +238,14 @@ class TradingEngine:
                 )
             except Exception as e:
                 logger.debug(f"[Engine] 시장 필터 조회 실패: {e}")
+
+            # 실시간 뉴스 수집 (5분 캐시)
+            try:
+                from core.news_fetcher import fetch_news_context
+                news_context = await fetch_news_context()
+                logger.debug(f"[Engine] 뉴스: {news_context.get('summary', '')[:80]}")
+            except Exception as e:
+                logger.debug(f"[Engine] 뉴스 수집 실패: {e}")
 
             # 외국인/기관 동향 병합 (국내주식만)
             try:
@@ -280,6 +289,7 @@ class TradingEngine:
                 fear_greed=fear_greed,
                 kospi_change=kospi_change,
                 nasdaq_change=nasdaq_change,
+                news_context=news_context,
             )
             self.llm_call_count += 1
 
@@ -492,22 +502,35 @@ class TradingEngine:
                 logger.warning(f"[Engine] {ticker} 현재가 없음, 매수 건너뜀")
                 return
 
-            qty = max(1, int(MAX_PER_SLOT // current_price))
+            from core.broker.kis import KISBroker
+            is_overseas = KISBroker._is_overseas(ticker)
+
+            # 해외 주식: 나스닥 장 시간 아니면 매수 건너뜀
+            if is_overseas and not self._is_nasdaq_hours():
+                logger.info(f"[Engine] {ticker} 나스닥 장 시간 아님, 매수 건너뜀")
+                return
+
+            if is_overseas:
+                # USD 기준 수량 계산 (슬롯 예산 ÷ 1380 환율 환산)
+                usd_budget = MAX_PER_SLOT / 1380
+                qty = max(1, int(usd_budget // current_price))
+            else:
+                qty = max(1, int(MAX_PER_SLOT // current_price))
+
             mode_cfg = TRADING_MODE_CONFIG.get(self.trading_mode, {})
             _stop_pct = mode_cfg.get("stop_pct", STOP_LOSS_PCT)
             _tp_pct = mode_cfg.get("take_profit_pct", TAKE_PROFIT_PCT)
-            stop_price = round(current_price * (1 - _stop_pct / 100), 0)
-            target_price = round(current_price * (1 + _tp_pct / 100), 0)
+            stop_price = round(current_price * (1 - _stop_pct / 100), 2 if is_overseas else 0)
+            target_price = round(current_price * (1 + _tp_pct / 100), 2 if is_overseas else 0)
 
             try:
-                from core.broker.kis import KISBroker
                 broker = KISBroker()
                 broker.connect()
-                if broker._is_overseas(ticker):
-                    order = broker.buy_overseas_market(ticker, qty)
+                if is_overseas:
+                    broker.buy_overseas_market(ticker, qty)
                     logger.info(f"[Engine] 해외 매수: {ticker} {qty}주 @ ${current_price:.2f}")
                 else:
-                    order = broker.buy_market(ticker, qty)
+                    broker.buy_market(ticker, qty)
                     logger.info(f"[Engine] 매수 주문: {ticker} {qty}주 @ {current_price:,.0f}원")
 
                 from database.models import PositionRecord
@@ -549,15 +572,15 @@ class TradingEngine:
             qty = pos.get("quantity", 0)
             avg_price = pos.get("avg_price", 0)
 
+            _is_overseas_sell = KISBroker._is_overseas(ticker)
             try:
-                from core.broker.kis import KISBroker
                 broker = KISBroker()
                 broker.connect()
-                if broker._is_overseas(ticker):
-                    order = broker.sell_overseas_market(ticker, qty)
+                if _is_overseas_sell:
+                    broker.sell_overseas_market(ticker, qty)
                     logger.info(f"[Engine] 해외 매도: {ticker} {qty}주 @ ${current_price:.2f}")
                 else:
-                    order = broker.sell_market(ticker, qty)
+                    broker.sell_market(ticker, qty)
                     logger.info(f"[Engine] 매도 주문: {ticker} {qty}주 @ {current_price:,.0f}원")
 
                 pnl = (current_price - avg_price) * qty if current_price > 0 and avg_price > 0 else 0

@@ -1,3 +1,4 @@
+import time
 from datetime import datetime, timedelta
 from typing import Any
 
@@ -15,6 +16,9 @@ from core.indicators import (
     is_pullback,
 )
 
+_OHLCV_CACHE: dict[str, tuple[pd.DataFrame, float]] = {}
+_OHLCV_TTL = 1800  # OHLCV 30분 캐시 (지표는 자주 바뀌지 않음)
+
 
 class DataFetcher:
     def __init__(self) -> None:
@@ -28,14 +32,32 @@ class DataFetcher:
             logger.warning(f"[Fetcher] {symbol} 조회 실패 (더미 반환): {e}")
             return self._dummy(symbol)
 
+    def _get_ohlcv_cached(self, symbol: str, is_overseas: bool) -> pd.DataFrame:
+        now = time.time()
+        cached = _OHLCV_CACHE.get(symbol)
+        if cached and (now - cached[1]) < _OHLCV_TTL:
+            return cached[0]
+        try:
+            if is_overseas:
+                df = self._broker.get_overseas_ohlcv(symbol, period=252)
+            else:
+                df = self._broker.get_ohlcv(symbol, period=252)
+            _OHLCV_CACHE[symbol] = (df, now)
+            return df
+        except Exception as e:
+            logger.debug(f"[Fetcher] {symbol} OHLCV 조회 실패, 캐시 사용: {e}")
+            return cached[0] if cached else pd.DataFrame()
+
     def _fetch_sync(self, symbol: str) -> dict[str, Any]:
         is_overseas = self._broker._is_overseas(symbol)
         if is_overseas:
             current_price = self._broker.get_overseas_price(symbol)
-            df = self._broker.get_overseas_ohlcv(symbol, period=252)
+            time.sleep(0.5)
+            df = self._get_ohlcv_cached(symbol, True)
         else:
             current_price = self._broker.get_current_price(symbol)
-            df = self._broker.get_ohlcv(symbol, period=252)
+            time.sleep(0.5)
+            df = self._get_ohlcv_cached(symbol, False)
 
         closes = df["close"].tolist() if not df.empty else []
         volumes = df["volume"].tolist() if not df.empty else []

@@ -154,6 +154,7 @@ class LLMJudge:
         fear_greed: dict[str, Any] | None = None,
         kospi_change: float = 0.0,
         nasdaq_change: float = 0.0,
+        news_context: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         if self._client is None:
             result = self._rule_based_judge(market_data, positions)
@@ -164,6 +165,7 @@ class LLMJudge:
         prompt = self._build_prompt(
             market_data, positions, watchlist, trading_mode,
             fear_greed=fear_greed, kospi_change=kospi_change, nasdaq_change=nasdaq_change,
+            news_context=news_context,
         )
         try:
             response = self._client.messages.create(
@@ -264,12 +266,12 @@ class LLMJudge:
             elif pct_from_high is not None and pct_from_high <= 10:
                 confidence += 5
 
-            if confidence > best_confidence and volume_surge:
+            if confidence > best_confidence:
                 best_confidence = confidence
                 best_ticker = ticker
                 best_reason = ". ".join(reasons) + ". 올랜도킴 규칙 충족으로 매수 신호."
 
-        if best_ticker and best_confidence >= 70:
+        if best_ticker and best_confidence >= 55:
             price = market_data[best_ticker].get("current_price", 0)
             qty = max(1, int(2_500_000 // price)) if price > 0 else 1
             return {
@@ -297,6 +299,7 @@ class LLMJudge:
         fear_greed: dict[str, Any] | None = None,
         kospi_change: float = 0.0,
         nasdaq_change: float = 0.0,
+        news_context: dict[str, Any] | None = None,
     ) -> str:
         mode_labels = {
             "scalping": "스캘핑 (손절-1%/익절+1.5%)",
@@ -319,6 +322,19 @@ class LLMJudge:
             f"- 시장 매수 적합: {'예' if kospi_change >= -1.5 and fg_val >= 25 else '아니오'}"
         )
         lines.append("")
+
+        # 실시간 뉴스 섹션
+        if news_context:
+            lines.append("## 실시간 뉴스 (최근 5분)")
+            summary = news_context.get("summary", "")
+            if summary:
+                lines.append(f"- 요약: {summary}")
+            for label, key in [("코스피", "kospi_news"), ("반도체", "semiconductor_news"),
+                                ("거시경제", "macro_news"), ("미국주식", "us_news")]:
+                items = news_context.get(key, [])
+                if items:
+                    lines.append(f"- {label}: " + " | ".join(items[:3]))
+            lines.append("")
 
         lines.append("## 현재 시세 데이터 (기술 지표 포함)")
         for ticker, data in market_data.items():
