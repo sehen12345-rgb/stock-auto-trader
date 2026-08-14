@@ -527,11 +527,16 @@ class TradingEngine:
                 broker = KISBroker()
                 broker.connect()
                 if is_overseas:
-                    broker.buy_overseas_market(ticker, qty)
+                    order = broker.buy_overseas_market(ticker, qty)
                     logger.info(f"[Engine] 해외 매수: {ticker} {qty}주 @ ${current_price:.2f}")
                 else:
-                    broker.buy_market(ticker, qty)
+                    order = broker.buy_market(ticker, qty)
                     logger.info(f"[Engine] 매수 주문: {ticker} {qty}주 @ {current_price:,.0f}원")
+
+                from core.broker.kis import OrderStatus as KOrderStatus
+                if order.status == KOrderStatus.REJECTED:
+                    logger.warning(f"[Engine] 주문 거부됨: {ticker} — DB 저장 건너뜀")
+                    return
 
                 from database.models import PositionRecord
                 self.position_repo.upsert(PositionRecord(
