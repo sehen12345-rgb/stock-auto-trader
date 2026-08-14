@@ -14,6 +14,7 @@ from core.indicators import (
     detect_double_bottom,
     detect_support_resistance,
     is_pullback,
+    pullback_score,
 )
 
 _OHLCV_CACHE: dict[str, tuple[pd.DataFrame, float]] = {}
@@ -107,9 +108,11 @@ class DataFetcher:
             logger.warning(f"[Fetcher] {symbol} 기술 지표 계산 실패: {e}")
 
         pullback_detected: bool = False
+        pullback_info: dict = {}
         try:
             if not df.empty:
-                pullback_detected = is_pullback(df)
+                pullback_info = pullback_score(df)
+                pullback_detected = pullback_info.get("detected", False)
         except Exception as e:
             logger.warning(f"[Fetcher] {symbol} pullback 감지 실패: {e}")
 
@@ -167,6 +170,9 @@ class DataFetcher:
             "ema9": indicators.get("ema9"),
             "ema21": indicators.get("ema21"),
             "pullback_detected": pullback_detected,
+            "pullback_score": pullback_info.get("score", 0),
+            "pullback_depth_pct": pullback_info.get("depth_pct", 0.0),
+            "pullback_reasons": pullback_info.get("reasons", []),
             # 신규 지표
             "adx": indicators.get("adx"),
             "stoch_k": indicators.get("stoch_k"),

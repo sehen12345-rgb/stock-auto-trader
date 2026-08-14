@@ -26,6 +26,14 @@ async def auto_start_bot():
     from api.routes import engine
     if not engine.running:
         await engine.start()
+    # 텔레그램 폴링 시작 (봇 명령어 수신)
+    try:
+        from notifications.telegram_bot import run_polling
+        import asyncio
+        asyncio.create_task(run_polling())
+    except Exception as e:
+        from loguru import logger
+        logger.warning(f"[Main] 텔레그램 폴링 시작 실패: {e}")
 
 
 if __name__ == "__main__":

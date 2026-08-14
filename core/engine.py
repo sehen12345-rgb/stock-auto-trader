@@ -779,8 +779,38 @@ class TradingEngine:
                 asyncio.create_task(_safe(notify_trade(
                     "SELL", ticker, sell_qty, current_price, 0, 0, reason, pnl_pct=pnl_pct
                 )))
+
+                # 복리: 매도 후 시드 자동 갱신
+                asyncio.create_task(_safe(self._update_seed_amount()))
             except Exception as e:
                 logger.error(f"[Engine] 매도 실패 {ticker}: {e}")
+
+    async def _update_seed_amount(self) -> None:
+        """매도 후 실현 수익을 시드에 반영 (복리 운용)."""
+        global SEED_AMOUNT, MAX_PER_SLOT
+        try:
+            bal = self.fetcher._broker.get_balance()
+            new_seed = int(bal.total_value) if bal.total_value and bal.total_value > 0 else 0
+            if new_seed <= 0:
+                return
+            # 최솟값 보호: 현재 시드보다 10% 이상 늘었을 때만 업데이트
+            if new_seed > SEED_AMOUNT * 1.01:
+                old = SEED_AMOUNT
+                SEED_AMOUNT = new_seed
+                MAX_PER_SLOT = SEED_AMOUNT // MAX_SLOTS
+                # .env 저장
+                _env_path = os.path.join(os.path.dirname(__file__), "..", ".env")
+                with open(_env_path, "r", encoding="utf-8") as f:
+                    lines = f.readlines()
+                for i, line in enumerate(lines):
+                    if line.startswith("SEED_AMOUNT="):
+                        lines[i] = f"SEED_AMOUNT={SEED_AMOUNT}\n"
+                        break
+                with open(_env_path, "w", encoding="utf-8") as f:
+                    f.writelines(lines)
+                logger.info(f"[Engine] 복리 시드 갱신: {old:,} → {SEED_AMOUNT:,}원")
+        except Exception as e:
+            logger.debug(f"[Engine] 시드 갱신 실패 (무시): {e}")
 
     async def get_portfolio(self) -> dict[str, Any]:
         if DEMO_MODE:

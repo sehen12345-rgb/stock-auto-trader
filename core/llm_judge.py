@@ -212,7 +212,7 @@ class LLMJudge:
         try:
             response = self._client.messages.create(
                 model="claude-haiku-4-5-20251001",
-                max_tokens=256,
+                max_tokens=384,
                 system=[{
                     "type": "text",
                     "text": SYSTEM_PROMPT,
@@ -438,6 +438,13 @@ class LLMJudge:
             if macd is not None and macd_sig is not None:
                 macd_dir = "골든크로스↑" if macd > macd_sig else "데드크로스↓"
 
+            pullback_score = data.get("pullback_score", 0)
+            pullback_depth = data.get("pullback_depth_pct", 0.0)
+            pullback_reasons = data.get("pullback_reasons", [])
+            pullback_str = (
+                f"감지(점수={pullback_score}/100, 깊이={pullback_depth:.1f}%, {','.join(pullback_reasons)})"
+                if pullback else "없음"
+            )
             lines.append(
                 f"- {ticker}: 현재가={data.get('current_price')}, "
                 f"MA20={data.get('ma20')}, "
@@ -449,7 +456,7 @@ class LLMJudge:
                 f"MACD={macd_dir}({round(macd, 4) if macd is not None else 'N/A'}), "
                 f"BB상단={bb_upper}, BB하단={bb_lower}, "
                 f"ATR={atr}, EMA9={ema9}, "
-                f"눌림목={pullback}, "
+                f"눌림목={pullback_str}, "
                 f"ADX={adx if adx is not None else 'N/A'}, "
                 f"Stoch%K={stoch_k if stoch_k is not None else 'N/A'}, "
                 f"Stoch%D={stoch_d if stoch_d is not None else 'N/A'}, "

@@ -499,40 +499,106 @@ def calc_volume_profile(df: pd.DataFrame, bins: int = 20) -> dict[str, Any]:
 
 
 def is_pullback(df: pd.DataFrame, lookback: int = 5) -> bool:
-    """눌림목(pullback) 감지.
+    """눌림목(pullback) 감지 — bool 래퍼."""
+    result = pullback_score(df, lookback)
+    return result["detected"]
 
-    최근 lookback 봉 중 고점 대비 3~10% 되돌린 후 반등이 시작됐으면 True.
 
-    Args:
-        df: OHLCV DataFrame
-        lookback: 확인할 최근 봉 수
+def pullback_score(df: pd.DataFrame, lookback: int = 10) -> dict:
+    """올랜도킴 눌림목 품질 점수 (0~100) + 상세 분석.
+
+    조건별 가중치:
+    - 되돌림 깊이 3~8%: +30 (올랜도킴 핵심)
+    - MA20 위 (상승 추세): +20
+    - RSI 40~65 (과열/침체 아님): +20
+    - MACD > 0 (모멘텀 양): +15
+    - 반등일 거래량 급증: +15
 
     Returns:
-        bool
+        {detected, score, depth_pct, reasons}
     """
+    result = {"detected": False, "score": 0, "depth_pct": 0.0, "reasons": []}
     try:
-        if df is None or len(df) < lookback + 2:
-            return False
+        if df is None or len(df) < lookback + 5:
+            return result
 
-        df = df.copy()
-        recent = df.iloc[-(lookback + 2):]
-        closes = recent["close"].tolist()
+        closes = df["close"].tolist()
+        volumes = df["volume"].tolist()
 
-        # 구간 고점
-        peak = max(closes[:-1])
-        current = closes[-1]
-        prev = closes[-2]
+        recent_closes = closes[-(lookback + 2):]
+        peak = max(recent_closes[:-1])
+        trough = min(recent_closes[:-1])
+        current = recent_closes[-1]
+        prev = recent_closes[-2]
 
         if peak <= 0:
-            return False
+            return result
 
-        drawdown_pct = (peak - min(closes[:-1])) / peak * 100
-        rebound = current > prev  # 직전 봉 대비 반등
+        depth_pct = (peak - trough) / peak * 100
+        rebound = current > prev
+        result["depth_pct"] = round(depth_pct, 2)
 
-        return 3.0 <= drawdown_pct <= 10.0 and rebound
+        if not (3.0 <= depth_pct <= 10.0 and rebound):
+            return result
+
+        score = 0
+        reasons = []
+
+        # 되돌림 깊이 점수 (3~8% 최적)
+        if 3.0 <= depth_pct <= 8.0:
+            score += 30
+            reasons.append(f"눌림목 {depth_pct:.1f}% (최적)")
+        else:
+            score += 15
+            reasons.append(f"눌림목 {depth_pct:.1f}% (양호)")
+
+        # MA20 위
+        if len(closes) >= 20:
+            ma20 = sum(closes[-20:]) / 20
+            if current > ma20:
+                score += 20
+                reasons.append("MA20 위")
+
+        # RSI 40~65
+        try:
+            close_s = pd.Series(closes)
+            delta = close_s.diff()
+            gain = delta.clip(lower=0).ewm(com=13, min_periods=14).mean()
+            loss = (-delta.clip(upper=0)).ewm(com=13, min_periods=14).mean()
+            rsi = 100 - (100 / (1 + gain / loss.replace(0, float("nan"))))
+            rsi_val = float(rsi.iloc[-1])
+            if 40 <= rsi_val <= 65:
+                score += 20
+                reasons.append(f"RSI {rsi_val:.0f}")
+        except Exception:
+            pass
+
+        # MACD > 0
+        try:
+            close_s = pd.Series(closes)
+            ema12 = close_s.ewm(span=12, adjust=False).mean()
+            ema26 = close_s.ewm(span=26, adjust=False).mean()
+            macd = float((ema12 - ema26).iloc[-1])
+            if macd > 0:
+                score += 15
+                reasons.append("MACD 양전환")
+        except Exception:
+            pass
+
+        # 반등일 거래량 급증
+        if len(volumes) >= 20:
+            avg_vol = sum(volumes[-20:-1]) / 19
+            if avg_vol > 0 and volumes[-1] >= avg_vol * 1.3:
+                score += 15
+                reasons.append(f"반등 거래량 {volumes[-1]/avg_vol:.1f}배")
+
+        result["detected"] = True
+        result["score"] = min(score, 100)
+        result["reasons"] = reasons
+        return result
     except Exception as e:
-        logger.debug(f"[indicators] is_pullback 오류: {e}")
-        return False
+        logger.debug(f"[indicators] pullback_score 오류: {e}")
+        return result
 
 
 # ── 내부 헬퍼 ──────────────────────────────────────────────────────────────

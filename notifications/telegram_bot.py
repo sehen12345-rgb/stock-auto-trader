@@ -28,6 +28,11 @@ def _get_app() -> Any:
         _app.add_handler(CommandHandler("stop",      cmd_stop))
         _app.add_handler(CommandHandler("start",     cmd_start))
         _app.add_handler(CommandHandler("watchlist", cmd_watchlist))
+        _app.add_handler(CommandHandler("positions", cmd_positions))
+        _app.add_handler(CommandHandler("sell",      cmd_sell))
+        _app.add_handler(CommandHandler("mode",      cmd_mode))
+        _app.add_handler(CommandHandler("seed",      cmd_seed))
+        _app.add_handler(CommandHandler("help",      cmd_help))
         logger.info("[Telegram] 봇 핸들러 등록 완료")
     except Exception as e:
         logger.warning(f"[Telegram] 봇 초기화 실패: {e}")
@@ -262,6 +267,136 @@ async def cmd_watchlist(update: Any, context: Any) -> None:
         await update.message.reply_text("\n".join(lines), parse_mode="HTML")
     except Exception as e:
         await update.message.reply_text(f"오류: {e}")
+
+
+async def cmd_positions(update: Any, context: Any) -> None:
+    try:
+        from core.engine import TradingEngine
+        engine = TradingEngine()
+        positions = await engine.get_positions()
+        if not positions:
+            await update.message.reply_text("📊 보유 포지션 없음")
+            return
+        lines = ["📊 <b>현재 포지션</b>"]
+        for p in positions:
+            pnl = p.get("pnl_pct", 0)
+            sign = "+" if pnl >= 0 else ""
+            emoji = "🟢" if pnl >= 0 else "🔴"
+            stop = p.get("stop_price", 0)
+            target = p.get("target_price", 0)
+            lines.append(
+                f"{emoji} <code>{p['symbol']}</code> {p['quantity']}주\n"
+                f"   매수가: {p['avg_price']:,.0f}  현재: {p.get('current_price',0):,.0f}\n"
+                f"   수익률: {sign}{pnl:.2f}%  |  손절: {stop:,.0f}  목표: {target:,.0f}"
+            )
+        await update.message.reply_text("\n".join(lines), parse_mode="HTML")
+    except Exception as e:
+        await update.message.reply_text(f"오류: {e}")
+
+
+async def cmd_sell(update: Any, context: Any) -> None:
+    """/sell TICKER — 수동 즉시 매도."""
+    try:
+        from core.engine import TradingEngine
+        engine = TradingEngine()
+        args = context.args
+        if not args:
+            await update.message.reply_text("사용법: /sell 종목코드\n예) /sell 005930")
+            return
+        ticker = args[0].upper()
+        positions = await engine.get_positions()
+        pos = next((p for p in positions if p.get("symbol") == ticker), None)
+        if pos is None:
+            await update.message.reply_text(f"❌ {ticker} 미보유 종목입니다.")
+            return
+        market_data = {}
+        try:
+            data = await engine.fetcher.fetch(ticker)
+            market_data[ticker] = data
+        except Exception:
+            market_data[ticker] = {"current_price": pos.get("current_price", 0)}
+        await engine._execute(
+            {"decision": "SELL", "ticker": ticker, "quantity": pos["quantity"],
+             "confidence": 99, "reason": "텔레그램 수동 매도"},
+            positions, market_data,
+        )
+        await update.message.reply_text(f"✅ {ticker} 매도 주문 실행됨")
+    except Exception as e:
+        await update.message.reply_text(f"오류: {e}")
+
+
+async def cmd_mode(update: Any, context: Any) -> None:
+    """/mode [MODE] — 매매 모드 조회 또는 변경."""
+    try:
+        from core.engine import TradingEngine, TRADING_MODE_CONFIG
+        engine = TradingEngine()
+        args = context.args
+        if not args:
+            cfg = TRADING_MODE_CONFIG.get(engine.trading_mode, {})
+            await update.message.reply_text(
+                f"⚙️ <b>현재 모드: {engine.trading_mode}</b>\n"
+                f"틱 간격: {cfg.get('tick_interval')}초\n"
+                f"손절: -{cfg.get('stop_pct')}%  목표: +{cfg.get('take_profit_pct')}%\n\n"
+                f"변경: /mode scalping | day_trading | swing | long_term",
+                parse_mode="HTML",
+            )
+            return
+        new_mode = args[0].lower()
+        if new_mode not in TRADING_MODE_CONFIG:
+            await update.message.reply_text(f"❌ 지원 모드: scalping, day_trading, swing, long_term")
+            return
+        engine.set_trading_mode(new_mode)
+        cfg = TRADING_MODE_CONFIG[new_mode]
+        await update.message.reply_text(
+            f"✅ 모드 변경: <b>{new_mode}</b>\n"
+            f"손절 -{cfg['stop_pct']}% / 목표 +{cfg['take_profit_pct']}%",
+            parse_mode="HTML",
+        )
+    except Exception as e:
+        await update.message.reply_text(f"오류: {e}")
+
+
+async def cmd_seed(update: Any, context: Any) -> None:
+    """/seed — 현재 시드 및 누적 손익 조회."""
+    try:
+        import os
+        from core.engine import TradingEngine, SEED_AMOUNT
+        engine = TradingEngine()
+        pf = await engine.get_portfolio()
+        total = pf.get("total_value", 0)
+        cash = pf.get("cash", 0)
+        initial_seed = int(os.getenv("SEED_AMOUNT", "2000000"))
+        pnl_amt = total - initial_seed if total > 0 else 0
+        pnl_sign = "+" if pnl_amt >= 0 else ""
+        emoji = "📈" if pnl_amt >= 0 else "📉"
+        await update.message.reply_text(
+            f"{emoji} <b>시드 현황</b>\n"
+            f"초기 시드: {initial_seed:,}원\n"
+            f"현재 시드: <b>{SEED_AMOUNT:,}원</b>\n"
+            f"총 평가액: {total:,}원\n"
+            f"예수금: {cash:,}원\n"
+            f"누적 손익: {pnl_sign}{pnl_amt:,}원",
+            parse_mode="HTML",
+        )
+    except Exception as e:
+        await update.message.reply_text(f"오류: {e}")
+
+
+async def cmd_help(update: Any, context: Any) -> None:
+    await update.message.reply_text(
+        "📋 <b>사용 가능한 명령어</b>\n\n"
+        "/status — 봇 상태 확인\n"
+        "/positions — 보유 포지션 (손절/목표가 포함)\n"
+        "/portfolio — 포트폴리오 요약\n"
+        "/sell 종목코드 — 즉시 매도 (예: /sell 005930)\n"
+        "/mode — 현재 매매 모드 확인\n"
+        "/mode day_trading — 모드 변경\n"
+        "/seed — 시드 및 누적 손익\n"
+        "/watchlist — 관심종목 목록\n"
+        "/start — 봇 시작\n"
+        "/stop — 봇 중지",
+        parse_mode="HTML",
+    )
 
 
 async def notify_nasdaq_open(positions: list[dict]) -> None:
