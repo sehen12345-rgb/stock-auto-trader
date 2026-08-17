@@ -31,7 +31,7 @@ def _get_app() -> Any:
     if _app is not None:
         return _app
     try:
-        from telegram.ext import Application, CommandHandler
+        from telegram.ext import Application, CommandHandler, CallbackQueryHandler
         _app = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
         _app.add_handler(CommandHandler("status",    cmd_status))
         _app.add_handler(CommandHandler("portfolio", cmd_portfolio))
@@ -43,7 +43,9 @@ def _get_app() -> Any:
         _app.add_handler(CommandHandler("mode",      cmd_mode))
         _app.add_handler(CommandHandler("seed",      cmd_seed))
         _app.add_handler(CommandHandler("journal",   cmd_journal))
+        _app.add_handler(CommandHandler("liquidate", cmd_liquidate))
         _app.add_handler(CommandHandler("help",      cmd_help))
+        _app.add_handler(CallbackQueryHandler(handle_callback))
         logger.info("[Telegram] 봇 핸들러 등록 완료")
     except Exception as e:
         logger.warning(f"[Telegram] 봇 초기화 실패: {e}")
@@ -449,24 +451,107 @@ async def cmd_journal(update: Any, context: Any) -> None:
         await update.message.reply_text(f"오류: {e}")
 
 
+async def cmd_liquidate(update: Any, context: Any) -> None:
+    """/liquidate — 전량 즉시 청산 + 봇 중지 (확인 버튼)."""
+    if not _is_authorized(update):
+        return
+    try:
+        from telegram import InlineKeyboardButton, InlineKeyboardMarkup
+        keyboard = InlineKeyboardMarkup([[
+            InlineKeyboardButton("⚠️ 예, 전량 청산", callback_data="liquidate_confirm"),
+            InlineKeyboardButton("❌ 취소", callback_data="liquidate_cancel"),
+        ]])
+        await update.message.reply_text(
+            "⚠️ <b>전량 청산 확인</b>\n\n"
+            "모든 포지션을 즉시 매도하고 봇을 중지합니다.\n"
+            "정말 실행하시겠습니까?",
+            parse_mode="HTML",
+            reply_markup=keyboard,
+        )
+    except Exception as e:
+        await update.message.reply_text(f"오류: {e}")
+
+
+async def handle_callback(update: Any, context: Any) -> None:
+    """Inline 버튼 콜백 처리."""
+    query = update.callback_query
+    if not query:
+        return
+    try:
+        if str(query.message.chat_id) != str(TELEGRAM_CHAT_ID):
+            await query.answer("권한 없음")
+            return
+        await query.answer()
+
+        if query.data == "liquidate_confirm":
+            from core.engine import TradingEngine
+            engine = TradingEngine()
+            positions = await engine.get_positions()
+            await engine._close_all_positions(reason="텔레그램 수동 전량 청산")
+            await engine.stop()
+            await query.edit_message_text(
+                f"✅ <b>전량 청산 완료</b>\n"
+                f"{len(positions)}개 포지션 매도 + 봇 중지됨",
+                parse_mode="HTML",
+            )
+
+        elif query.data == "liquidate_cancel":
+            await query.edit_message_text("❌ 청산 취소됨")
+
+        elif query.data == "bot_start":
+            from core.engine import TradingEngine
+            engine = TradingEngine()
+            if not engine.running:
+                await engine.start()
+                await query.edit_message_text("🟢 봇 시작됨")
+            else:
+                await query.edit_message_text("이미 실행 중")
+
+        elif query.data == "bot_stop":
+            from core.engine import TradingEngine
+            engine = TradingEngine()
+            if engine.running:
+                await engine.stop()
+                await query.edit_message_text("🔴 봇 중지됨")
+            else:
+                await query.edit_message_text("이미 중지 상태")
+
+    except Exception as e:
+        logger.warning(f"[Telegram] 콜백 처리 실패: {e}")
+        try:
+            await query.edit_message_text(f"오류: {e}")
+        except Exception:
+            pass
+
+
 async def cmd_help(update: Any, context: Any) -> None:
     if not _is_authorized(update):
         return
-    await update.message.reply_text(
-        "📋 <b>사용 가능한 명령어</b>\n\n"
-        "/status — 봇 상태 확인\n"
-        "/positions — 보유 포지션 (손절/목표가 포함)\n"
-        "/portfolio — 포트폴리오 요약\n"
-        "/journal — 최근 3일 매매 일지\n"
-        "/sell 종목코드 — 즉시 매도 (예: /sell 005930)\n"
-        "/mode — 현재 매매 모드 확인\n"
-        "/mode day_trading — 모드 변경\n"
-        "/seed — 시드 및 누적 손익\n"
-        "/watchlist — 관심종목 목록\n"
-        "/start — 봇 시작\n"
-        "/stop — 봇 중지",
-        parse_mode="HTML",
-    )
+    try:
+        from telegram import InlineKeyboardButton, InlineKeyboardMarkup
+        keyboard = InlineKeyboardMarkup([[
+            InlineKeyboardButton("▶ 봇 시작", callback_data="bot_start"),
+            InlineKeyboardButton("⏹ 봇 중지", callback_data="bot_stop"),
+        ]])
+        await update.message.reply_text(
+            "📋 <b>사용 가능한 명령어</b>\n\n"
+            "/status — 봇 상태 확인\n"
+            "/positions — 보유 포지션 (손절/목표가 포함)\n"
+            "/portfolio — 포트폴리오 요약\n"
+            "/journal — 최근 3일 매매 일지\n"
+            "/sell 종목코드 — 즉시 매도 (예: /sell 005930)\n"
+            "/liquidate — ⚠️ 전량 즉시 청산 + 봇 중지\n"
+            "/mode — 현재 매매 모드 확인\n"
+            "/mode day_trading — 모드 변경\n"
+            "/seed — 시드 및 누적 손익\n"
+            "/watchlist — 관심종목 목록\n"
+            "/start — 봇 시작\n"
+            "/stop — 봇 중지",
+            parse_mode="HTML",
+            reply_markup=keyboard,
+        )
+    except Exception as e:
+        await update.message.reply_text(f"오류: {e}")
 
 
 async def notify_nasdaq_open(positions: list[dict]) -> None:

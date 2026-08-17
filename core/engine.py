@@ -148,6 +148,12 @@ class TradingEngine:
             from core.alert_monitor import AlertMonitor
             self.alert_monitor = AlertMonitor(self.fetcher)
         await self.alert_monitor.start()
+        # APScheduler 스케줄러 시작
+        try:
+            from core.scheduler import setup_scheduler
+            setup_scheduler(self)
+        except Exception as _sched_err:
+            logger.warning(f"[Engine] 스케줄러 시작 실패 (무시): {_sched_err}")
         # 시작시 실제 KIS 잔고 동기화 (SEED + DB 포지션)
         asyncio.create_task(_safe(self._sync_positions_on_start()))
         # KIS 체결 이력 → 로컬 DB 동기화 (기기 간 매매일지 일치)
@@ -157,6 +163,11 @@ class TradingEngine:
 
     async def stop(self) -> None:
         self.running = False
+        try:
+            from core.scheduler import shutdown_scheduler
+            shutdown_scheduler()
+        except Exception:
+            pass
         if self._task:
             self._task.cancel()
             try:
@@ -961,6 +972,17 @@ class TradingEngine:
                     return
                 else:
                     self._sell_cooldown.pop(ticker, None)
+
+            # 경제 이벤트 고위험 기간 매수 차단 (FOMC/CPI/PCE 당일·전일)
+            try:
+                from core.econ_calendar import is_high_risk_period, get_high_impact_today
+                if is_high_risk_period():
+                    events = get_high_impact_today()
+                    event_names = ", ".join(e["event"] for e in events[:2]) if events else "고영향 이벤트 임박"
+                    logger.info(f"[Engine] {ticker} 매수 차단 — 경제 이벤트 고위험 기간 ({event_names})")
+                    return
+            except Exception as _econ_err:
+                logger.debug(f"[Engine] 경제 캘린더 체크 실패 (무시): {_econ_err}")
 
             # 약세장에서 신규 매수 차단
             regime = self._market_regime.get("regime", "neutral")
