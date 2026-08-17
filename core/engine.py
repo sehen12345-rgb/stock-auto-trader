@@ -70,6 +70,10 @@ class TradingEngine:
         self._task: asyncio.Task | None = None
         self.alert_monitor: "AlertMonitor | None" = None
 
+        # 손절 후 재진입 차단: {symbol: monotonic_timestamp}
+        self._sell_cooldown: dict[str, float] = {}
+        self._SELL_COOLDOWN_SECS: float = 86400.0  # 24시간
+
         # 매매 모드 (환경변수로 영속화)
         self.trading_mode: str = os.getenv("TRADING_MODE", "swing")
         # 트레일링 스탑: {symbol: 최고가}
@@ -456,11 +460,12 @@ class TradingEngine:
         except Exception as e:
             logger.debug(f"[Engine] 팩터 스코어 계산 실패: {e}")
 
-            # 외국인/기관 동향 병합 (국내주식만)
+        # 외국인/기관 동향 병합 (국내주식만) — 팩터 계산 성공/실패 무관하게 항상 실행
+        if not DEMO_MODE:
             try:
                 from core.kis_extra import get_investor_trend
                 from core.broker.kis import KISBroker
-                kis_broker = self.fetcher._broker  # 기존 연결 재사용
+                kis_broker = self.fetcher._broker
                 for ticker in tickers:
                     if not KISBroker._is_overseas(ticker):
                         investor = get_investor_trend(ticker, kis_broker)
@@ -468,6 +473,22 @@ class TradingEngine:
                             market_data[ticker].update(investor)
             except Exception as e:
                 logger.debug(f"[Engine] 외국인/기관 동향 조회 실패: {e}")
+
+        # Finnhub 감성·인사이더 데이터 market_data에 병합 (해외주식, 30분 캐시)
+        if not DEMO_MODE and self._is_nasdaq_hours():
+            try:
+                from core.finnhub_client import get_news_sentiment, get_insider_trades, get_company_news
+                from core.broker.kis import KISBroker as _KFinn
+                for ticker, data in market_data.items():
+                    if _KFinn._is_overseas(ticker):
+                        data["finnhub_sentiment"] = get_news_sentiment(ticker)
+                        insider = get_insider_trades(ticker)
+                        data["insider_net_shares"] = insider.get("net_buy_shares", 0)
+                        data["insider_buy_count"]  = insider.get("buy_count", 0)
+                        data["insider_sell_count"] = insider.get("sell_count", 0)
+                        data["finnhub_news"]       = get_company_news(ticker, max_items=3)
+            except Exception as e:
+                logger.debug(f"[Engine] Finnhub 데이터 병합 실패: {e}")
 
         positions = await self.get_positions()
 
@@ -930,6 +951,17 @@ class TradingEngine:
         current_price = market_data.get(ticker, {}).get("current_price", 0)
 
         if action == "BUY":
+            # 손절 후 24h 재진입 차단
+            cooldown_ts = self._sell_cooldown.get(ticker, 0.0)
+            if cooldown_ts > 0:
+                elapsed = _time.monotonic() - cooldown_ts
+                if elapsed < self._SELL_COOLDOWN_SECS:
+                    remaining_h = (self._SELL_COOLDOWN_SECS - elapsed) / 3600
+                    logger.info(f"[Engine] {ticker} 재진입 차단 — 손절 후 {remaining_h:.1f}h 대기")
+                    return
+                else:
+                    self._sell_cooldown.pop(ticker, None)
+
             # 약세장에서 신규 매수 차단
             regime = self._market_regime.get("regime", "neutral")
             if regime == "bear":
@@ -1154,6 +1186,11 @@ class TradingEngine:
                 pnl_pct = round((current_price - avg_price) / avg_price * 100, 2) if avg_price > 0 else 0
                 self._daily_loss += pnl
                 self._persist_daily_loss()  # 재시작 후에도 한도 유지
+
+                # 손절(마이너스 청산) 시 24h 재진입 차단 등록
+                if pnl < 0 and remaining == 0:
+                    self._sell_cooldown[ticker] = _time.monotonic()
+                    logger.info(f"[Engine] {ticker} 손절 완료 → 24h 재진입 차단 등록")
 
                 remaining = full_qty - sell_qty
                 if remaining > 0:

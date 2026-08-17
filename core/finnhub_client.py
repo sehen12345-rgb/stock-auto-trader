@@ -197,6 +197,55 @@ def get_news_sentiment(ticker: str) -> float:
         return 0.0
 
 
+# ── 종목 뉴스 헤드라인 ────────────────────────────────────────────────────
+
+_company_news_cache: dict[str, tuple[float, Any]] = {}
+_COMPANY_NEWS_TTL: float = 1800.0  # 30분
+
+
+def get_company_news(ticker: str, max_items: int = 5) -> list[str]:
+    """최근 종목 뉴스 헤드라인 반환.
+
+    Returns:
+        ["headline1", "headline2", ...] (최대 max_items개)
+        실패 시: []
+    """
+    now = time.monotonic()
+    cached = _company_news_cache.get(ticker)
+    if cached and (now - cached[0]) < _COMPANY_NEWS_TTL:
+        return list(cached[1])
+
+    try:
+        today = date.today()
+        from_date = (today - timedelta(days=7)).isoformat()
+        to_date = today.isoformat()
+
+        data = _get("/company-news", {
+            "symbol": ticker,
+            "from": from_date,
+            "to": to_date,
+        })
+
+        if not isinstance(data, list):
+            _company_news_cache[ticker] = (now, [])
+            return []
+
+        headlines = [
+            item.get("headline", "").strip()
+            for item in data[:max_items]
+            if item.get("headline", "").strip()
+        ]
+        _company_news_cache[ticker] = (now, headlines)
+        logger.debug(f"[Finnhub] {ticker} 뉴스 {len(headlines)}건")
+        return headlines
+
+    except ValueError:
+        return []
+    except Exception as e:
+        logger.debug(f"[Finnhub] {ticker} 뉴스 헤드라인 조회 실패: {e}")
+        return []
+
+
 # ── 어닝 임박 여부 (편의 함수) ────────────────────────────────────────────
 
 def is_earnings_imminent(ticker: str, days: int = 3) -> bool:

@@ -488,6 +488,13 @@ class LLMJudge:
             institution_net = data.get("institution_net", 0)
             foreign_buying = data.get("foreign_buying", False)
 
+            # Finnhub (해외주식)
+            finnhub_sentiment = data.get("finnhub_sentiment")
+            insider_net_shares = data.get("insider_net_shares", 0)
+            insider_buy_count  = data.get("insider_buy_count", 0)
+            insider_sell_count = data.get("insider_sell_count", 0)
+            finnhub_news: list[str] = data.get("finnhub_news", [])
+
             # 쌍바닥
             double_bottom = data.get("double_bottom", False)
 
@@ -526,7 +533,16 @@ class LLMJudge:
                 f"지지근처={near_support}, 저항근처={near_resistance}, "
                 f"외국인순매수={foreign_net:+,}, 기관순매수={institution_net:+,}, "
                 f"외국인매수중={foreign_buying}"
+                + (
+                    f", Finnhub감성={finnhub_sentiment:+.3f}"
+                    f", 인사이더순매수={insider_net_shares:+,}주(매수{insider_buy_count}/매도{insider_sell_count})"
+                    if finnhub_sentiment is not None else ""
+                )
             )
+            if finnhub_news:
+                lines.append(
+                    f"  [{ticker} 최신뉴스] " + " | ".join(finnhub_news)
+                )
 
         lines.append("\n## 현재 보유 포지션")
         if positions:
