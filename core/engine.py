@@ -8,27 +8,33 @@ from loguru import logger
 
 from config.settings import KIS_MOCK
 from core.llm_judge import LLMJudge
+from core.risk_manager import calc_atr_stop, calc_position_size, kelly_position_size
+from core.factor_score import score_ticker, rank_tickers, MIN_SCORE_TO_TRADE
+from core.sector_filter import is_sector_favorable
 from database.db import get_db
 from database.models import PositionRepository, TradeRepository
 
 DEMO_MODE: bool = os.getenv("DEMO_MODE", "false").lower() == "true"
-SEED_AMOUNT: int = int(os.getenv("SEED_AMOUNT", "2000000"))
-MAX_SLOTS: int = 4                              # 최대 4종목 동시 보유
-MAX_PER_SLOT: int = SEED_AMOUNT // MAX_SLOTS   # 종목당 50만원
-STOP_LOSS_PCT: float = 3.5
-TAKE_PROFIT_PCT: float = 6.0
-MAX_DAILY_LOSS: int = SEED_AMOUNT // 20        # 일 손실 한도 ~10만원
+SEED_AMOUNT: int = int(os.getenv("SEED_AMOUNT", "2011811"))
+MAX_SLOTS: int = 2                              # 201만원 시드 → 2종목 집중투자
+MAX_PER_SLOT: int = SEED_AMOUNT // MAX_SLOTS   # 종목당 ~100만원
+STOP_LOSS_PCT: float = 2.0                     # 작은 시드 → 손실 빠르게 컷
+TAKE_PROFIT_PCT: float = 5.0
+MAX_DAILY_LOSS: int = int(SEED_AMOUNT * 0.03)  # 일 손실 한도 3% (~6만원)
 
 # 매매 모드별 설정
 TRADING_MODE_CONFIG: dict[str, dict[str, Any]] = {
-    "scalping":    {"tick_interval": 10,  "stop_pct": 1.0, "take_profit_pct": 1.5},
-    "day_trading": {"tick_interval": 30,  "stop_pct": 2.0, "take_profit_pct": 4.0},
-    "swing":       {"tick_interval": 300, "stop_pct": 3.5, "take_profit_pct": 8.0},
-    "long_term":   {"tick_interval": 300, "stop_pct": 3.5, "take_profit_pct": 6.0},
+    "scalping":    {"tick_interval": 10,  "stop_pct": 0.8, "take_profit_pct": 1.5},
+    "day_trading": {"tick_interval": 30,  "stop_pct": 1.5, "take_profit_pct": 3.0},
+    "swing":       {"tick_interval": 300, "stop_pct": 2.0, "take_profit_pct": 5.0},
+    "long_term":   {"tick_interval": 300, "stop_pct": 2.5, "take_profit_pct": 8.0},
 }
 
 # 트레일링 스탑 하락 허용 % (최고가 대비)
-TRAILING_STOP_PCT: float = 2.0
+TRAILING_STOP_PCT: float = 1.5
+
+# 최대 보유 기간 (일) — 이 초과 시 수익/손실 무관 청산 (기회비용 관리)
+MAX_HOLD_DAYS: int = 10
 
 
 class TradingEngine:
@@ -62,9 +68,10 @@ class TradingEngine:
         self._decisions: list[dict[str, Any]] = []
         self._watchlist: dict[str, str] = {}
         self._task: asyncio.Task | None = None
+        self.alert_monitor: "AlertMonitor | None" = None
 
         # 매매 모드 (환경변수로 영속화)
-        self.trading_mode: str = os.getenv("TRADING_MODE", "day_trading")
+        self.trading_mode: str = os.getenv("TRADING_MODE", "swing")
         # 트레일링 스탑: {symbol: 최고가}
         self._trailing_stops: dict[str, float] = {}
         # 분할매도 1차 완료: {symbol: 1차매도가}
@@ -76,6 +83,17 @@ class TradingEngine:
         self._FEAR_GREED_TTL: float = 300.0  # 5분
         self._kospi_change: float = 0.0
         self._nasdaq_change: float = 0.0
+
+        # 마켓 리짐 캐시
+        self._market_regime: dict[str, Any] = {"regime": "neutral"}
+        self._regime_ts: float = 0.0
+        self._REGIME_TTL: float = 1800.0  # 30분
+
+        # 팩터 스코어 캐시 (tick마다 갱신)
+        self._factor_scores: dict[str, float] = {}
+
+        # 분할매수 접근 알림 중복 방지: {ticker_티어_approaching: bool}
+        self._approaching_alerts: dict[str, bool] = {}
 
         # 올랜도킴 기본 관심종목 (우량주 위주)
         _DEFAULT_WATCHLIST: dict[str, str] = {
@@ -93,6 +111,9 @@ class TradingEngine:
             "TSLA": "Tesla",
             "VRT": "Vertiv",
             "DELL": "Dell",
+            "GE": "GE Aerospace",    # 방산·항공엔진 방어주, 적정가 $363
+            "BE": "Bloom Energy",     # AI 전력 인프라, 적정가 $230
+            "DDOG": "Datadog",        # 소프트웨어 저평가 회복주
         }
 
         if DEMO_MODE:
@@ -119,6 +140,14 @@ class TradingEngine:
         self._started_at = datetime.now()
         self._task = asyncio.create_task(self._loop())
         logger.info("[Engine] 봇 시작")
+        if self.alert_monitor is None:
+            from core.alert_monitor import AlertMonitor
+            self.alert_monitor = AlertMonitor(self.fetcher)
+        await self.alert_monitor.start()
+        # 시작시 실제 KIS 잔고 동기화 (SEED + DB 포지션)
+        asyncio.create_task(_safe(self._sync_positions_on_start()))
+        # KIS 체결 이력 → 로컬 DB 동기화 (기기 간 매매일지 일치)
+        asyncio.create_task(_safe(self._sync_trade_history_from_kis()))
         from notifications.telegram_bot import notify_start
         asyncio.create_task(_safe(notify_start()))
 
@@ -126,10 +155,21 @@ class TradingEngine:
         self.running = False
         if self._task:
             self._task.cancel()
+            try:
+                await self._task
+            except asyncio.CancelledError:
+                pass
             self._task = None
+        # 아직 실행 중인 비동기 작업들 취소 (주문 중복 방지)
+        tasks = [t for t in asyncio.all_tasks()
+                 if t is not asyncio.current_task() and not t.done()]
+        for t in tasks:
+            t.cancel()
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
         logger.info("[Engine] 봇 중지")
         from notifications.telegram_bot import notify_stop
-        asyncio.create_task(_safe(notify_stop()))
+        await _safe(notify_stop())
 
     async def _loop(self) -> None:
         while self.running:
@@ -157,15 +197,17 @@ class TradingEngine:
                 if not DEMO_MODE and dtime(15, 20) <= now.time() <= dtime(15, 25):
                     await self._close_kospi_before_nasdaq()
 
-                # 나스닥 장 시작 알림
+                # 나스닥 정규장 시작 알림 (22:30 KST) + 올랜도킴 야간 리포트
                 if not DEMO_MODE and self._is_nasdaq_hours() and not self._nasdaq_open_notified:
                     self._nasdaq_open_notified = True
                     self._nasdaq_close_notified = False
-                    from notifications.telegram_bot import notify_nasdaq_open
+                    from notifications.telegram_bot import notify_nasdaq_open, notify_daily_orlando
                     asyncio.create_task(_safe(notify_nasdaq_open(await self.get_positions())))
+                    market_data_snap = getattr(self, "_last_market_data", {})
+                    asyncio.create_task(_safe(notify_daily_orlando(market_data_snap)))
 
-                # 나스닥 장 종료 리셋
-                if not DEMO_MODE and not self._is_nasdaq_hours() and self._nasdaq_open_notified:
+                # 나스닥 장 종료 리셋 (다음 날 재알림 위해)
+                if not DEMO_MODE and not self._is_nasdaq_hours() and not self._is_premarket_hours() and self._nasdaq_open_notified:
                     self._nasdaq_open_notified = False
 
                 # 모드별 tick interval
@@ -232,18 +274,61 @@ class TradingEngine:
         market_close = now_et.replace(hour=16, minute=0, second=0, microsecond=0)
         return market_open <= now_et <= market_close
 
+    def _is_premarket_hours(self) -> bool:
+        """나스닥 프리마켓 04:00~09:30 ET (KST 17:00~22:30)."""
+        from zoneinfo import ZoneInfo
+        import datetime as _dt
+        now_et = _dt.datetime.now(ZoneInfo("America/New_York"))
+        premarket_open  = now_et.replace(hour=4,  minute=0, second=0, microsecond=0)
+        premarket_close = now_et.replace(hour=9, minute=30, second=0, microsecond=0)
+        return premarket_open <= now_et < premarket_close
+
+    def _is_afterhours(self) -> bool:
+        """애프터마켓 16:00~20:00 ET."""
+        from zoneinfo import ZoneInfo
+        import datetime as _dt
+        now_et = _dt.datetime.now(ZoneInfo("America/New_York"))
+        ah_open  = now_et.replace(hour=16, minute=0, second=0, microsecond=0)
+        ah_close = now_et.replace(hour=20, minute=0, second=0, microsecond=0)
+        return ah_open <= now_et <= ah_close
+
     def _is_any_market_hours(self) -> bool:
-        return self._is_market_hours() or self._is_nasdaq_hours()
+        return self._is_market_hours() or self._is_nasdaq_hours() \
+               or self._is_premarket_hours() or self._is_afterhours()
 
     def _reset_daily_loss_if_needed(self) -> None:
         today = datetime.now().strftime("%Y-%m-%d")
         if today != self._daily_loss_date:
+            # 날짜 바뀌면 메모리 초기화, DB는 날짜별로 유지
             self._daily_loss = 0.0
             self._daily_loss_date = today
+        else:
+            # 재시작 시 오늘 손실 DB에서 복원
+            if self._daily_loss == 0.0:
+                try:
+                    row = self.position_repo.db.execute_one(
+                        "SELECT loss FROM daily_loss WHERE date=?", (today,)
+                    )
+                    if row:
+                        self._daily_loss = float(row["loss"])
+                except Exception:
+                    pass
+
+    def _persist_daily_loss(self) -> None:
+        """오늘 손실을 DB에 저장 — 재시작 후에도 유지."""
+        today = datetime.now().strftime("%Y-%m-%d")
+        try:
+            self.position_repo.db.execute(
+                "INSERT INTO daily_loss(date, loss) VALUES(?,?) "
+                "ON CONFLICT(date) DO UPDATE SET loss=excluded.loss",
+                (today, self._daily_loss),
+            )
+        except Exception as e:
+            logger.debug(f"[Engine] 일손실 저장 실패: {e}")
 
     def _is_daily_loss_exceeded(self) -> bool:
         self._reset_daily_loss_if_needed()
-        return self._daily_loss <= -MAX_DAILY_LOSS
+        return self._daily_loss < -MAX_DAILY_LOSS
 
     def _get_fear_greed_cached(self) -> dict[str, Any]:
         """Fear & Greed 지수 조회 (5분 캐시)."""
@@ -262,9 +347,39 @@ class TradingEngine:
 
     async def _tick(self) -> None:
         self.last_tick = datetime.now()
-        tickers = list(self._watchlist.keys())
-        if not tickers:
+        self._tick_count = getattr(self, "_tick_count", 0) + 1
+        # 10틱(약 5분)마다 실제 잔고로 SEED_AMOUNT 자동 갱신
+        if not DEMO_MODE and self._tick_count % 10 == 0:
+            asyncio.create_task(_safe(self._update_seed_amount()))
+
+        from core.broker.kis import KISBroker as _KISBroker
+
+        all_tickers = list(self._watchlist.keys())
+        if not all_tickers:
             return
+
+        # ── 장 시간에 따라 분석 대상 종목 필터링 ─────────────────────────────
+        kospi_open   = self._is_market_hours()
+        # KIS Open API는 프리마켓/애프터마켓 주문 미지원 → 정규장만 허용
+        nasdaq_open  = self._is_nasdaq_hours()
+        if not DEMO_MODE:
+            tickers = []
+            for t in all_tickers:
+                if _KISBroker._is_overseas(t):
+                    if nasdaq_open:
+                        tickers.append(t)
+                    else:
+                        logger.debug(f"[Engine] 나스닥 마감 — {t} 패스")
+                else:
+                    if kospi_open:
+                        tickers.append(t)
+                    else:
+                        logger.debug(f"[Engine] 코스피 마감 — {t} 패스")
+            if not tickers:
+                logger.info("[Engine] 분석 대상 종목 없음 (모든 시장 마감)")
+                return
+        else:
+            tickers = all_tickers
 
         market_data: dict[str, Any] = {}
         if DEMO_MODE:
@@ -278,6 +393,9 @@ class TradingEngine:
                     market_data[ticker] = data
                 except Exception as e:
                     logger.warning(f"[Engine] {ticker} 시세 조회 실패: {e}")
+
+        # 올랜도킴 리포트용 최신 시세 저장
+        self._last_market_data = market_data
 
         # 시장 필터 데이터 조회
         fear_greed: dict[str, Any] = {"value": 50, "rating": "Neutral"}
@@ -301,6 +419,19 @@ class TradingEngine:
             except Exception as e:
                 logger.debug(f"[Engine] 시장 필터 조회 실패: {e}")
 
+            # 마켓 리짐 조회 (30분 캐시)
+            try:
+                from core.market_filter import get_market_regime
+                now_mono = _time.monotonic()
+                if not self._market_regime.get("regime") or (now_mono - self._regime_ts) > self._REGIME_TTL:
+                    self._market_regime = get_market_regime()
+                    self._regime_ts = now_mono
+                regime = self._market_regime.get("regime", "neutral")
+                logger.debug(f"[Engine] 마켓 리짐: {regime} (QQQ {self._market_regime.get('pct_from_ma200', 0):+.1f}% vs MA200)")
+            except Exception as e:
+                logger.debug(f"[Engine] 마켓 리짐 조회 실패: {e}")
+                regime = "neutral"
+
             # 실시간 뉴스 수집 (5분 캐시)
             try:
                 from core.news_fetcher import fetch_news_context
@@ -309,12 +440,27 @@ class TradingEngine:
             except Exception as e:
                 logger.debug(f"[Engine] 뉴스 수집 실패: {e}")
 
+        # 팩터 스코어 계산 (미보유 종목만 랭킹)
+        factor_scores: dict[str, float] = {}
+        try:
+            held_syms = {p.get("symbol") for p in await self.get_positions()}
+            ranked = rank_tickers(market_data, held_syms, regime=self._market_regime.get("regime", "neutral"))
+            factor_scores = dict(ranked)
+            self._factor_scores = factor_scores
+            top3 = [(t, s) for t, s in ranked if t not in held_syms][:3]
+            if top3:
+                logger.info(
+                    f"[Engine] 팩터 TOP3: "
+                    + " | ".join(f"{t} {s:.0f}점" for t, s in top3)
+                )
+        except Exception as e:
+            logger.debug(f"[Engine] 팩터 스코어 계산 실패: {e}")
+
             # 외국인/기관 동향 병합 (국내주식만)
             try:
                 from core.kis_extra import get_investor_trend
                 from core.broker.kis import KISBroker
-                kis_broker = KISBroker()
-                kis_broker.connect()
+                kis_broker = self.fetcher._broker  # 기존 연결 재사용
                 for ticker in tickers:
                     if not KISBroker._is_overseas(ticker):
                         investor = get_investor_trend(ticker, kis_broker)
@@ -325,12 +471,16 @@ class TradingEngine:
 
         positions = await self.get_positions()
 
-        # 손절/익절 자동 체크 (장 중)
-        if not DEMO_MODE and self._is_market_hours():
+        # 손절/익절 자동 체크 (코스피 또는 나스닥 장 중)
+        if not DEMO_MODE and (self._is_market_hours() or self._is_nasdaq_hours()):
             await self._check_stop_conditions(positions, market_data)
             # 트레일링 스탑 체크
             await self._check_trailing_stops(positions, market_data)
             positions = await self.get_positions()
+
+        # 분할매수 체크 (나스닥/코스피 장 중)
+        if not DEMO_MODE and (self._is_market_hours() or self._is_nasdaq_hours()):
+            await self._check_tier_buys(positions, market_data)
 
         # 전략 신호 생성 (기술 지표 기반)
         strategy_signal: dict[str, Any] | None = None
@@ -352,6 +502,7 @@ class TradingEngine:
                 kospi_change=kospi_change,
                 nasdaq_change=nasdaq_change,
                 news_context=news_context,
+                factor_scores=factor_scores,
             )
             self.llm_call_count += 1
 
@@ -553,35 +704,75 @@ class TradingEngine:
 
             pnl_pct = (current - avg) / avg * 100
 
-            # ── 단타 분할매도 ──────────────────────────────
-            # 1차 익절: +2%(KOSPI) 또는 +4%(해외) 도달 시 50% 매도
-            # 이후 나머지는 트레일링 스탑 -1%로 관리
-            if self.trading_mode == "day_trading" and sym not in self._partial_sold:
-                is_os = _KIS._is_overseas(sym)
-                first_tp = 4.0 if is_os else 2.0
-                if pnl_pct >= first_tp and qty >= 2:
-                    half = qty // 2
-                    reason = (
-                        f"분할매도 1차: +{pnl_pct:.1f}% 도달 → {half}주 익절, "
-                        f"나머지 {qty - half}주 트레일링 스탑 관리"
-                    )
-                    logger.info(f"[Engine] {sym} {reason}")
-                    self._partial_sold[sym] = current  # 1차 매도 완료 표시
-                    # 트레일링 스탑을 현재가 기준으로 재설정
-                    self._trailing_stops[sym] = current
-                    await self._execute(
-                        {"decision": "SELL", "ticker": sym, "quantity": half,
-                         "confidence": 90, "reason": reason},
-                        positions, market_data,
-                    )
-                    continue
+            # ── 분할매도 ──────────────────────────────────────
+            # ※ 리서치 노트 분할매수(tier_) 포지션은 목표가까지 보유 — 분할매도 제외
+            strategy_tag_p = p.get("strategy", "")
+            is_tier_position = strategy_tag_p.startswith("tier_")
+            is_os = _KIS._is_overseas(sym)
+
+            # 모드별 1차 익절 기준
+            # day_trading : 해외 +3%, 국내 +1.5%
+            # swing       : 해외 +3%, 국내 +2.5%  ← 201만원 스윙 핵심
+            if self.trading_mode == "day_trading":
+                first_tp = 3.0 if is_os else 1.5
+            elif self.trading_mode == "swing":
+                first_tp = 3.0 if is_os else 2.5
+            else:
+                first_tp = None  # scalping / long_term 은 분할매도 없음
+
+            if (
+                first_tp is not None
+                and sym not in self._partial_sold
+                and not is_tier_position
+                and pnl_pct >= first_tp
+                and qty >= 2
+            ):
+                half = qty // 2
+                reason = (
+                    f"분할매도 1차: +{pnl_pct:.1f}% 도달 → {half}주 익절 "
+                    f"(나머지 {qty - half}주 트레일링 스탑 {TRAILING_STOP_PCT}% 관리)"
+                )
+                logger.info(f"[Engine] {sym} {reason}")
+                self._partial_sold[sym] = current
+                self._trailing_stops[sym] = current  # 현재가 기준 트레일링 스탑 재설정
+                await self._execute(
+                    {"decision": "SELL", "ticker": sym, "quantity": half,
+                     "confidence": 90, "reason": reason},
+                    positions, market_data,
+                )
+                continue
+
+            # ── 최대 보유 기간 초과 강제 청산 ─────────────────────
+            # 201만원 소액 시드: 기회비용 관리, 애매한 종목은 슬롯 점유 방지
+            opened_at_str = p.get("opened_at", "")
+            if opened_at_str and not is_tier_position:
+                try:
+                    from datetime import date
+                    opened_date = datetime.fromisoformat(str(opened_at_str)).date()
+                    hold_days = (date.today() - opened_date).days
+                    if hold_days >= MAX_HOLD_DAYS:
+                        hold_reason = (
+                            f"최대 보유 기간 초과 ({hold_days}일 >= {MAX_HOLD_DAYS}일) "
+                            f"현재 손익: {pnl_pct:+.1f}%"
+                        )
+                        logger.info(f"[Engine] {sym} {hold_reason} → 강제 청산")
+                        self._partial_sold.pop(sym, None)
+                        self._trailing_stops.pop(sym, None)
+                        await self._execute(
+                            {"decision": "SELL", "ticker": sym, "quantity": qty,
+                             "confidence": 80, "reason": hold_reason},
+                            positions, market_data,
+                        )
+                        continue
+                except Exception:
+                    pass
 
             # ── 손절 / 전량 익절 ───────────────────────────
             reason = ""
             if stop > 0 and current <= stop:
-                reason = f"손절가 도달 ({current:,.0f} <= {stop:,.0f})"
+                reason = f"손절가 도달 ({current:,.2f} <= {stop:,.2f})"
             elif target > 0 and current >= target:
-                reason = f"익절가 도달 ({current:,.0f} >= {target:,.0f})"
+                reason = f"익절가 도달 ({current:,.2f} >= {target:,.2f})"
 
             if reason:
                 logger.info(f"[Engine] {sym} {reason} → 전량 매도")
@@ -592,6 +783,124 @@ class TradingEngine:
                      "confidence": 95, "reason": reason},
                     positions, market_data,
                 )
+
+    async def _check_tier_buys(
+        self,
+        positions: list[dict[str, Any]],
+        market_data: dict[str, Any],
+    ) -> None:
+        """리서치 노트 분할매수 가격 도달 시 자동 매수 집행."""
+        if DEMO_MODE:
+            return
+        # 약세장이면 분할매수도 차단
+        if self._market_regime.get("regime") == "bear":
+            return
+
+        try:
+            from database.db import get_db
+            rows = get_db().execute(
+                "SELECT ticker, buy_tier_1, buy_tier_2, buy_tier_3, stop_price, target_price, toss_alert_only "
+                "FROM research_notes WHERE buy_tier_1 > 0 OR buy_tier_2 > 0 OR buy_tier_3 > 0",
+                ()
+            )
+        except Exception as e:
+            logger.debug(f"[Engine] 분할매수 리서치 조회 실패: {e}")
+            return
+
+        held = {p.get("symbol") for p in positions}
+
+        for row in rows:
+            ticker = row["ticker"]
+            current = market_data.get(ticker, {}).get("current_price", 0)
+            if current <= 0:
+                continue
+
+            # 각 티어별 체크 (이미 보유 중인 경우 추가매수 허용)
+            tiers = [
+                (row["buy_tier_1"], "1차"),
+                (row["buy_tier_2"], "2차"),
+                (row["buy_tier_3"], "3차"),
+            ]
+            for tier_price, tier_label in tiers:
+                if not tier_price or tier_price <= 0:
+                    continue
+
+                toss_only = bool(row["toss_alert_only"] if row["toss_alert_only"] is not None else 0)
+                pct_away = (current - tier_price) / tier_price * 100
+                alert_key = f"{ticker}_{tier_label}_approaching"
+
+                # ── 접근 알림: 매수가 5% 이내 도달 시 텔레그램 선알림 ──────
+                if 0 < pct_away <= 5.0:
+                    if not self._approaching_alerts.get(alert_key):
+                        self._approaching_alerts[alert_key] = True
+                        from notifications.telegram_bot import _send
+                        account_tag = "📲 토스에서 직접 매수하세요!" if toss_only else "🤖 KIS 자동매수 예정"
+                        is_os = ticker.isalpha() and not ticker.startswith("0")
+                        price_str = f"${current:,.2f}" if is_os else f"{current:,.0f}원"
+                        tier_str  = f"${tier_price:,.2f}" if is_os else f"{tier_price:,.0f}원"
+                        asyncio.create_task(_safe(_send(
+                            f"⚠️ <b>매수가 접근!</b>\n"
+                            f"종목: <code>{ticker}</code>\n"
+                            f"현재가: <b>{price_str}</b>\n"
+                            f"🎯 {tier_label} 매수가: <b>{tier_str}</b> ({pct_away:.1f}% 남음)\n"
+                            f"{account_tag}"
+                        )))
+                elif pct_away > 5.0:
+                    self._approaching_alerts.pop(alert_key, None)
+
+                # 현재가가 티어 가격 이하로 내려온 경우
+                if current > tier_price:
+                    continue
+
+                # ── 토스 알림 전용 종목: 자동매수 없이 알림만 ──────────────
+                if toss_only:
+                    alert_hit_key = f"{ticker}_{tier_label}_hit"
+                    if not self._approaching_alerts.get(alert_hit_key):
+                        self._approaching_alerts[alert_hit_key] = True
+                        from notifications.telegram_bot import _send
+                        is_os = ticker.isalpha() and not ticker.startswith("0")
+                        price_str = f"${current:,.2f}" if is_os else f"{current:,.0f}원"
+                        tier_str  = f"${tier_price:,.2f}" if is_os else f"{tier_price:,.0f}원"
+                        asyncio.create_task(_safe(_send(
+                            f"🔔 <b>매수가 도달!</b>\n"
+                            f"종목: <code>{ticker}</code>\n"
+                            f"현재가: <b>{price_str}</b>\n"
+                            f"✅ {tier_label} 매수가 <b>{tier_str}</b> 도달\n"
+                            f"📲 <b>토스증권에서 지금 바로 매수하세요!</b>"
+                        )))
+                    continue  # KIS 자동매수 건너뜀
+
+                # ── KIS 자동매수 ─────────────────────────────────────────────
+                already_bought = any(
+                    p.get("symbol") == ticker and p.get("strategy", "").startswith(f"tier_{tier_label}")
+                    for p in positions
+                )
+                if already_bought:
+                    continue
+
+                if len(held) >= MAX_SLOTS and ticker not in held:
+                    logger.info(f"[Engine] {ticker} {tier_label} 분할매수 대기 — 슬롯 한도")
+                    break
+
+                reason = (
+                    f"리서치 노트 {tier_label} 분할매수 — "
+                    f"목표가 ${row['target_price']:,.0f} / 손절 ${row['stop_price']:,.0f}"
+                )
+                logger.info(f"[Engine] {ticker} {tier_label} 분할매수 진입 ({current:,.2f} <= {tier_price:,.2f})")
+
+                await self._execute(
+                    {
+                        "decision": "BUY",
+                        "ticker": ticker,
+                        "confidence": 80,
+                        "reason": reason,
+                        "strategy_override": f"tier_{tier_label}",
+                    },
+                    positions,
+                    market_data,
+                )
+                held.add(ticker)
+                break
 
     async def _execute(
         self,
@@ -621,11 +930,24 @@ class TradingEngine:
         current_price = market_data.get(ticker, {}).get("current_price", 0)
 
         if action == "BUY":
+            # 약세장에서 신규 매수 차단
+            regime = self._market_regime.get("regime", "neutral")
+            if regime == "bear":
+                logger.info(f"[Engine] {ticker} 매수 차단 — 약세장 (QQQ MA200 하단)")
+                return
+
             # 확신도 70% 미만이면 매수 차단 (매매 품질 향상)
             confidence = decision.get("confidence", 0)
             if confidence < 70:
                 logger.info(f"[Engine] {ticker} 확신도 부족 ({confidence}% < 70%), 매수 건너뜀")
                 return
+
+            # 팩터 스코어 필터 (리서치 노트 분할매수는 면제)
+            if not decision.get("strategy_override"):
+                factor_score = self._factor_scores.get(ticker, 0)
+                if factor_score < MIN_SCORE_TO_TRADE and not DEMO_MODE:
+                    logger.info(f"[Engine] {ticker} 팩터 점수 미달 ({factor_score:.0f}/{MIN_SCORE_TO_TRADE}), 매수 건너뜀")
+                    return
             if ticker in held_symbols:
                 logger.info(f"[Engine] 이미 보유 중: {ticker}")
                 return
@@ -639,10 +961,47 @@ class TradingEngine:
             from core.broker.kis import KISBroker
             is_overseas = KISBroker._is_overseas(ticker)
 
-            # 해외 주식: 나스닥 장 시간 아니면 매수 건너뜀
+            # 해외 주식: 나스닥 정규장 시간에만 매수 (KIS Open API는 프리/애프터마켓 미지원)
             if is_overseas and not self._is_nasdaq_hours():
                 logger.info(f"[Engine] {ticker} 나스닥 장 시간 아님, 매수 건너뜀")
                 return
+
+            # 진입 타임 필터 (나스닥 개장/마감 직후 30분 고변동성 구간 제외)
+            if is_overseas:
+                from datetime import datetime as _dt
+                now_time = _dt.now().time()
+                from datetime import time as _t
+                # KST 기준: 22:30~23:00 (개장 직후), 04:30~05:00 (마감 직전)
+                in_volatile = (
+                    (_t(22, 30) <= now_time <= _t(23, 0)) or
+                    (_t(4, 30) <= now_time <= _t(5, 0))
+                )
+                if in_volatile:
+                    logger.info(f"[Engine] {ticker} 나스닥 고변동 시간대 매수 차단")
+                    return
+
+            # 어닝 발표 3일 이내 매수 차단 (Finnhub)
+            if is_overseas:
+                try:
+                    from core.finnhub_client import get_earnings_calendar
+                    cal = get_earnings_calendar(ticker)
+                    days_until = cal.get("days_until")
+                    if days_until is not None and 0 <= days_until <= 3:
+                        msg = f"{ticker} 어닝 {days_until}일 전 — 매수 차단"
+                        logger.info(f"[Engine] {msg}")
+                        from notifications.telegram_bot import _send
+                        import asyncio as _asyncio
+                        _asyncio.create_task(_safe(_send(f"⚠️ {msg}")))
+                        return
+                except Exception as _earn_err:
+                    logger.debug(f"[Engine] 어닝 캘린더 체크 실패 (무시): {_earn_err}")
+
+            # 섹터 모멘텀 필터 (해외주식)
+            if is_overseas:
+                favorable, sector_info = is_sector_favorable(ticker)
+                if not favorable:
+                    logger.info(f"[Engine] {ticker} 섹터 역풍 ({sector_info}), 매수 차단")
+                    return
 
             # 실제 예수금 조회
             available_cash = 0
@@ -655,52 +1014,63 @@ class TradingEngine:
                 invested = sum(p.get("value", 0) for p in positions)
                 available_cash = max(0, SEED_AMOUNT - invested)
 
-            # 남은 슬롯 수로 예수금 동적 배분
-            remaining_slots = MAX_SLOTS - len(held_symbols)
-            budget_per_slot = available_cash / max(remaining_slots, 1)
+            strategy_tag = decision.get("strategy_override", self.trading_mode)
 
-            if is_overseas:
-                usd_budget = budget_per_slot / 1380
-                qty = int(usd_budget // current_price)
-                # 슬롯 예산 부족해도 전체 예수금으로 1주 살 수 있으면 매수
-                if qty == 0 and (available_cash / 1380) >= current_price:
-                    qty = 1
-            else:
-                qty = int(budget_per_slot // current_price)
-                # 슬롯 예산 부족해도 전체 예수금으로 1주 살 수 있으면 매수
-                if qty == 0 and available_cash >= current_price:
-                    qty = 1
+            # ATR 기반 동적 손절
+            atr = market_data.get(ticker, {}).get("atr")
+            stop_price = calc_atr_stop(current_price, atr, is_overseas)
 
-            if qty <= 0:
-                logger.warning(
-                    f"[Engine] {ticker} 매수 불가 — 예수금 {available_cash:,.0f}원 < 현재가 {current_price:,.0f}원"
+            # 목표가: 리서치 노트 목표가 우선, 없으면 손익비 2:1 폴백
+            # 올랜도킴 전략 = 리서치 노트 target_price까지 장기 보유가 원칙
+            research_target: float = 0.0
+            research_stop: float = 0.0
+            try:
+                from database.db import get_db
+                rn = get_db().execute(
+                    "SELECT target_price, stop_price FROM research_notes WHERE ticker=?",
+                    (ticker,)
                 )
+                row_rn = rn.fetchone() if rn else None
+                if row_rn:
+                    research_target = float(row_rn["target_price"] or 0)
+                    research_stop   = float(row_rn["stop_price"]   or 0)
+            except Exception:
+                pass
+
+            risk_per_share = current_price - stop_price
+            if research_target > current_price:
+                # 리서치 노트 목표가 사용 (올랜도킴 장기 보유 원칙)
+                target_price = round(research_target, 2 if is_overseas else 0)
+                # 리서치 노트 손절가도 있으면 적용 (더 넓은 ATR 손절이면 ATR 유지)
+                if research_stop > 0 and research_stop < stop_price:
+                    stop_price = round(research_stop, 2 if is_overseas else 0)
+                logger.debug(
+                    f"[Engine] {ticker} 리서치 노트 목표가 적용: "
+                    f"손절={stop_price} / 목표={target_price} (올랜도킴 장기 보유)"
+                )
+            else:
+                # 리서치 노트 없음 → 손익비 2:1 폴백 (단기 스윙)
+                target_price = round(current_price + risk_per_share * 2, 2 if is_overseas else 0)
+                logger.debug(
+                    f"[Engine] {ticker} ATR 손절: {stop_price} / 목표가: {target_price} (위험/보상=1:2)"
+                )
+
+            # 리스크 패리티 포지션 사이징
+            usd_krw_rate = self.fetcher._broker.get_usd_krw_rate() if is_overseas else 1300.0
+            qty = calc_position_size(
+                available_cash=available_cash,
+                entry_price=current_price,
+                stop_price=stop_price,
+                seed_amount=SEED_AMOUNT,
+                is_overseas=is_overseas,
+                usd_krw=usd_krw_rate,
+            )
+            if qty <= 0:
+                logger.warning(f"[Engine] {ticker} 리스크 사이징 결과 0주 — 매수 건너뜀")
                 return
 
-            # 실제 필요금액이 예수금 초과하면 수량 줄이기
-            if available_cash > 0 and available_cash < current_price * qty:
-                qty = int(available_cash // current_price)
-                if qty <= 0:
-                    logger.warning(
-                        f"[Engine] {ticker} 잔고 부족 (가용: {available_cash:,.0f}원, 필요: {current_price:,.0f}원)"
-                    )
-                    return
-
-            mode_cfg = TRADING_MODE_CONFIG.get(self.trading_mode, {})
-            _stop_pct = mode_cfg.get("stop_pct", STOP_LOSS_PCT)
-            _tp_pct = mode_cfg.get("take_profit_pct", TAKE_PROFIT_PCT)
-            # 단타 모드: 코스피는 빠른 회전 (-1.5%/+2%), 나스닥은 변동성 여유 (-2%/+4%)
-            if self.trading_mode == "day_trading":
-                if is_overseas:
-                    _stop_pct, _tp_pct = 2.0, 4.0
-                else:
-                    _stop_pct, _tp_pct = 1.5, 2.0
-            stop_price = round(current_price * (1 - _stop_pct / 100), 2 if is_overseas else 0)
-            target_price = round(current_price * (1 + _tp_pct / 100), 2 if is_overseas else 0)
-
             try:
-                broker = KISBroker()
-                broker.connect()
+                broker = self.fetcher._broker
                 if is_overseas:
                     order = broker.buy_overseas_market(ticker, qty)
                     logger.info(f"[Engine] 해외 매수: {ticker} {qty}주 @ ${current_price:.2f}")
@@ -720,8 +1090,8 @@ class TradingEngine:
                     avg_price=current_price,
                     stop_price=stop_price,
                     target_price=target_price,
-                    market="KOSPI",
-                    strategy=self.trading_mode,
+                    market="NASDAQ" if is_overseas else "KOSPI",
+                    strategy=strategy_tag,
                 ))
 
                 from database.models import Trade
@@ -733,8 +1103,8 @@ class TradingEngine:
                     price=current_price,
                     order_id=order.order_id,
                     status="FILLED",
-                    market="KOSPI",
-                    strategy=self.trading_mode,
+                    market="NASDAQ" if is_overseas else "KOSPI",
+                    strategy=strategy_tag,
                 ))
 
                 from notifications.telegram_bot import notify_trade
@@ -759,8 +1129,7 @@ class TradingEngine:
 
             _is_overseas_sell = KISBroker._is_overseas(ticker)
             try:
-                broker = KISBroker()
-                broker.connect()
+                broker = self.fetcher._broker
                 if _is_overseas_sell:
                     sell_order = broker.sell_overseas_market(ticker, sell_qty)
                     logger.info(f"[Engine] 해외 매도: {ticker} {sell_qty}주 @ ${current_price:.2f}")
@@ -784,6 +1153,7 @@ class TradingEngine:
                 pnl = round(gross_pnl - buy_fee - sell_fee, 0)
                 pnl_pct = round((current_price - avg_price) / avg_price * 100, 2) if avg_price > 0 else 0
                 self._daily_loss += pnl
+                self._persist_daily_loss()  # 재시작 후에도 한도 유지
 
                 remaining = full_qty - sell_qty
                 if remaining > 0:
@@ -808,7 +1178,7 @@ class TradingEngine:
                     price=current_price,
                     order_id=sell_order.order_id,
                     status="FILLED",
-                    market="KOSPI",
+                    market="NASDAQ" if _is_overseas_sell else "KOSPI",
                     strategy=self.trading_mode,
                     pnl=pnl,
                 ))
@@ -823,16 +1193,17 @@ class TradingEngine:
             except Exception as e:
                 logger.error(f"[Engine] 매도 실패 {ticker}: {e}")
 
-    async def _update_seed_amount(self) -> None:
-        """매도 후 실현 수익을 시드에 반영 (복리 운용)."""
+    async def _update_seed_amount(self, force: bool = False) -> None:
+        """실제 KIS 잔고로 SEED_AMOUNT 갱신 (복리 운용).
+        force=True: 시작시 강제 갱신 (1% 제한 없음).
+        """
         global SEED_AMOUNT, MAX_PER_SLOT
         try:
             bal = self.fetcher._broker.get_balance()
-            new_seed = int(bal.total_value) if bal.total_value and bal.total_value > 0 else 0
+            new_seed = int(bal.total_equity) if bal.total_equity and bal.total_equity > 0 else 0
             if new_seed <= 0:
                 return
-            # 최솟값 보호: 현재 시드보다 10% 이상 늘었을 때만 업데이트
-            if new_seed > SEED_AMOUNT * 1.01:
+            if force or new_seed != SEED_AMOUNT:
                 old = SEED_AMOUNT
                 SEED_AMOUNT = new_seed
                 MAX_PER_SLOT = SEED_AMOUNT // MAX_SLOTS
@@ -840,15 +1211,129 @@ class TradingEngine:
                 _env_path = os.path.join(os.path.dirname(__file__), "..", ".env")
                 with open(_env_path, "r", encoding="utf-8") as f:
                     lines = f.readlines()
+                found = False
                 for i, line in enumerate(lines):
                     if line.startswith("SEED_AMOUNT="):
                         lines[i] = f"SEED_AMOUNT={SEED_AMOUNT}\n"
+                        found = True
                         break
+                if not found:
+                    lines.append(f"SEED_AMOUNT={SEED_AMOUNT}\n")
                 with open(_env_path, "w", encoding="utf-8") as f:
                     f.writelines(lines)
-                logger.info(f"[Engine] 복리 시드 갱신: {old:,} → {SEED_AMOUNT:,}원")
+                logger.info(f"[Engine] 잔고 갱신: {old:,} → {SEED_AMOUNT:,}원 (종목당 {MAX_PER_SLOT:,}원)")
         except Exception as e:
-            logger.debug(f"[Engine] 시드 갱신 실패 (무시): {e}")
+            logger.debug(f"[Engine] 잔고 갱신 실패 (무시): {e}")
+
+    async def _sync_positions_on_start(self) -> None:
+        """서버 시작 시 KIS 실제 잔고와 DB 포지션 동기화."""
+        # 1) 잔고 갱신
+        await self._update_seed_amount(force=True)
+        if DEMO_MODE:
+            return
+        try:
+            # 2) KIS 실제 보유 종목 조회
+            kis_positions = await self.fetcher.fetch_kis_positions()
+            kis_symbols = {p["symbol"] for p in kis_positions}
+
+            # 3) DB에만 있고 KIS에 없는 포지션 → 청산된 것으로 간주 삭제
+            db_positions = self.position_repo.find_all()
+            for db_pos in db_positions:
+                if db_pos.symbol not in kis_symbols:
+                    logger.info(f"[Engine] 포지션 동기화: {db_pos.symbol} DB에만 존재 → 삭제")
+                    self.position_repo.delete(db_pos.symbol)
+
+            # 4) KIS에 있고 DB에 없는 포지션 → DB에 추가
+            db_syms = {p.symbol for p in self.position_repo.find_all()}
+            for kp in kis_positions:
+                sym = kp["symbol"]
+                if sym not in db_syms and kp.get("quantity", 0) > 0:
+                    from core.broker.kis import KISBroker as _K
+                    is_os = _K._is_overseas(sym)
+                    avg = kp.get("avg_price", 0)
+                    cfg = TRADING_MODE_CONFIG.get(self.trading_mode, {})
+                    sp = cfg.get("stop_pct", STOP_LOSS_PCT)
+                    tp = cfg.get("take_profit_pct", TAKE_PROFIT_PCT)
+                    dec = 2 if is_os else 0
+                    from database.models import PositionRecord
+                    self.position_repo.upsert(PositionRecord(
+                        symbol=sym,
+                        quantity=kp["quantity"],
+                        avg_price=avg,
+                        stop_price=round(avg * (1 - sp / 100), dec),
+                        target_price=round(avg * (1 + tp / 100), dec),
+                        market="NASDAQ" if is_os else "KOSPI",
+                        strategy=self.trading_mode,
+                    ))
+                    logger.info(f"[Engine] 포지션 동기화: {sym} KIS에만 존재 → DB 추가")
+
+            if kis_positions:
+                logger.info(f"[Engine] 포지션 동기화 완료 — KIS {len(kis_positions)}개")
+        except Exception as e:
+            logger.warning(f"[Engine] 포지션 동기화 실패 (무시): {e}")
+
+    async def _sync_trade_history_from_kis(self) -> None:
+        """서버 시작 시 KIS 체결 이력을 로컬 DB와 동기화 (기기 간 매매일지 일치)."""
+        if DEMO_MODE:
+            return
+        try:
+            # 기존 fetcher의 broker 재사용 (이미 connect + 토큰 발급 완료)
+            from core.broker.kis import KISBroker as _K
+            broker: _K = self.fetcher._broker  # type: ignore[assignment]
+            logger.info("[Engine] KIS 체결 이력 동기화 시작 (당일)")
+            # 국내 + 해외 체결 이력 통합
+            domestic_orders = broker.get_order_history(days=30)
+            overseas_orders = broker.get_overseas_order_history()
+            orders = domestic_orders + overseas_orders
+
+            # 기존 DB에 있는 order_id 집합
+            existing = {
+                row["order_id"]
+                for row in self.trade_repo.db.execute(
+                    "SELECT order_id FROM trades WHERE order_id != ''", ()
+                )
+            }
+
+            imported = 0
+            for o in orders:
+                if not o.order_id or o.order_id in existing:
+                    continue
+                created_at = o.raw.get("_created_at", datetime.now().strftime("%Y-%m-%dT%H:%M:%S"))
+                market = o.raw.get("_market", "KOSPI")
+
+                self.trade_repo.db.insert(
+                    """INSERT INTO trades
+                       (symbol, side, order_type, quantity, price,
+                        filled_qty, filled_price, order_id, status,
+                        market, strategy, pnl, created_at, updated_at)
+                       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                    (
+                        o.symbol,
+                        o.side.value,
+                        o.order_type.value,
+                        o.quantity,
+                        o.price,
+                        o.filled_qty,
+                        o.filled_price,
+                        o.order_id,
+                        "FILLED",
+                        market,
+                        "KIS_IMPORT",
+                        0.0,  # PnL: 평단가 없어서 0으로 저장 (나중에 포지션 기록과 매칭 가능)
+                        created_at,
+                        created_at,
+                    ),
+                )
+                existing.add(o.order_id)
+                imported += 1
+
+            if imported > 0:
+                logger.info(f"[Engine] KIS 체결 이력 {imported}건 DB 동기화 완료 "
+                            f"(국내 {len(domestic_orders)}건 + 해외 {len(overseas_orders)}건)")
+            else:
+                logger.info("[Engine] KIS 체결 이력 동기화: 신규 건 없음")
+        except Exception as e:
+            logger.warning(f"[Engine] KIS 체결 이력 동기화 실패 (무시): {e}")
 
     async def get_portfolio(self) -> dict[str, Any]:
         if DEMO_MODE:
@@ -958,7 +1443,21 @@ class TradingEngine:
         if DEMO_MODE:
             from core.demo_data import get_demo_return_history
             return get_demo_return_history(30)
-        return []
+        import datetime as _dt
+        result = []
+        today = _dt.date.today()
+        cumulative_pnl = 0.0
+        for i in range(29, -1, -1):  # 30일 전부터 오늘까지
+            d = today - _dt.timedelta(days=i)
+            date_str = d.strftime("%Y-%m-%d")
+            daily_pnl = self.trade_repo.daily_pnl(date_str)
+            cumulative_pnl += daily_pnl
+            result.append({
+                "date": date_str,
+                "pnl": round(daily_pnl, 0),
+                "cumulative_pnl": round(cumulative_pnl, 0),
+            })
+        return result
 
     def add_to_watchlist(self, ticker: str, name: str = "") -> None:
         self._watchlist[ticker] = name
@@ -967,9 +1466,12 @@ class TradingEngine:
         self._watchlist.pop(ticker, None)
 
     async def _notify_market_open(self) -> None:
-        from notifications.telegram_bot import notify_market_open
+        from notifications.telegram_bot import notify_market_open, notify_daily_orlando
         positions = await self.get_positions()
         await notify_market_open(positions)
+        # 올랜도킴 매수 모니터링 리포트 (장 시작 시)
+        market_data = getattr(self, "_last_market_data", {})
+        await notify_daily_orlando(market_data)
 
     async def _notify_market_close(self) -> None:
         from notifications.telegram_bot import notify_market_close

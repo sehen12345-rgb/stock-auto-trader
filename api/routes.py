@@ -35,6 +35,11 @@ class ResearchNoteRequest(BaseModel):
     summary: str = ""
     content: str = ""
     catalyst: str = ""
+    buy_tier_1: float = 0.0
+    buy_tier_2: float = 0.0
+    buy_tier_3: float = 0.0
+    stop_price: float = 0.0
+    horizon: str = ""
 
 
 @router.get("/status")
@@ -47,7 +52,13 @@ async def get_status() -> dict[str, Any]:
             "uptime_seconds": engine.uptime_seconds(),
             "last_tick": engine.last_tick.isoformat() if engine.last_tick else None,
             "llm_call_count": engine.llm_call_count,
-            "market_open": engine._is_market_hours(),
+            "market_open": engine._is_market_hours() or engine._is_nasdaq_hours(),
+            "market_regime": engine._market_regime.get("regime", "neutral"),
+            "qqq_vs_ma200": engine._market_regime.get("pct_from_ma200", 0),
+            "top_factors": [
+                {"ticker": t, "score": s}
+                for t, s in sorted(engine._factor_scores.items(), key=lambda x: x[1], reverse=True)[:5]
+            ],
         }
     except Exception as e:
         return {"running": False, "mode": "unknown", "demo_mode": False,
@@ -276,6 +287,51 @@ async def delete_research(note_id: int) -> dict[str, Any]:
     return {"status": "deleted", "id": note_id}
 
 
+@router.post("/research/{note_id}/create-alerts")
+async def create_research_alerts(note_id: int) -> dict[str, Any]:
+    """리서치 노트의 분할매수 가격대로 텔레그램 알림 자동 생성."""
+    from database.alert_repo import get_alert_repo
+
+    repo = get_research_repo()
+    note = repo.find_by_id(note_id)
+    if not note:
+        raise HTTPException(status_code=404, detail="리서치 노트 없음")
+
+    alert_repo = get_alert_repo()
+    ticker = note["ticker"]
+    source = note.get("source", "올랜도킴")
+    created = []
+
+    tiers = [
+        (note.get("buy_tier_1", 0), "1차 분할매수"),
+        (note.get("buy_tier_2", 0), "2차 분할매수"),
+        (note.get("buy_tier_3", 0), "3차 분할매수"),
+    ]
+    for price, label in tiers:
+        if price and price > 0:
+            aid = alert_repo.save(
+                ticker=ticker,
+                name=label,
+                alert_type="BELOW",
+                target_price=price,
+                memo=f"[{source}] {label} 구간 | 목표가 {note.get('target_price', 0)} | 손절 {note.get('stop_price', 0)}",
+            )
+            created.append({"id": aid, "label": label, "price": price})
+
+    # 목표가 도달 알림도 생성
+    if note.get("target_price", 0) > 0:
+        aid = alert_repo.save(
+            ticker=ticker,
+            name="목표가 도달",
+            alert_type="ABOVE",
+            target_price=note["target_price"],
+            memo=f"[{source}] 목표가 도달 — 매도 검토",
+        )
+        created.append({"id": aid, "label": "목표가", "price": note["target_price"]})
+
+    return {"status": "ok", "created": len(created), "alerts": created}
+
+
 class ResearchParseRequest(BaseModel):
     ticker: str
     raw_text: str
@@ -302,12 +358,17 @@ async def parse_research(req: ResearchParseRequest) -> dict[str, Any]:
 
 반드시 아래 JSON 형식만 반환 (설명 없이):
 {{
-  "source": "증권사/애널리스트명",
+  "source": "분석가/출처명",
   "rating": "Buy/Outperform/Hold 등",
   "target_price": 숫자(없으면 0),
   "current_price": 숫자(없으면 0),
   "summary": "핵심 요약 2-3문장",
-  "catalyst": "주요 촉매/이벤트"
+  "catalyst": "주요 촉매/이벤트",
+  "buy_tier_1": 숫자(1차 분할매수가, 없으면 0),
+  "buy_tier_2": 숫자(2차 분할매수가, 없으면 0),
+  "buy_tier_3": 숫자(3차 분할매수가, 없으면 0),
+  "stop_price": 숫자(손절가, 없으면 0),
+  "horizon": "투자 기간(예: 6개월, 1년)"
 }}"""
             }]
         )
@@ -324,7 +385,80 @@ async def parse_research(req: ResearchParseRequest) -> dict[str, Any]:
         raise HTTPException(status_code=500, detail=str(e))
 
 
+# ── 가격 알림 ─────────────────────────────────────────────────────────────────
+
+class AlertRequest(BaseModel):
+    ticker: str
+    name: str = ""
+    alert_type: str  # "ABOVE" | "BELOW" | "CHANGE_PCT"
+    target_price: float = 0.0
+    change_pct: float = 0.0
+    memo: str = ""
+
+
+@router.get("/alerts")
+async def list_alerts() -> list[dict[str, Any]]:
+    from database.alert_repo import get_alert_repo
+    return get_alert_repo().find_all()
+
+
+@router.post("/alerts")
+async def create_alert(req: AlertRequest) -> dict[str, Any]:
+    from database.alert_repo import get_alert_repo
+    if req.alert_type not in ("ABOVE", "BELOW", "CHANGE_PCT"):
+        raise HTTPException(status_code=400, detail="alert_type: ABOVE | BELOW | CHANGE_PCT")
+    aid = get_alert_repo().save(
+        ticker=req.ticker.upper(),
+        name=req.name,
+        alert_type=req.alert_type,
+        target_price=req.target_price,
+        change_pct=req.change_pct,
+        memo=req.memo,
+    )
+    return {"status": "created", "id": aid}
+
+
+@router.post("/alerts/{alert_id}/reactivate")
+async def reactivate_alert(alert_id: int) -> dict[str, Any]:
+    from database.alert_repo import get_alert_repo
+    get_alert_repo().reactivate(alert_id)
+    return {"status": "reactivated", "id": alert_id}
+
+
+@router.delete("/alerts/{alert_id}")
+async def delete_alert(alert_id: int) -> dict[str, Any]:
+    from database.alert_repo import get_alert_repo
+    get_alert_repo().delete(alert_id)
+    return {"status": "deleted", "id": alert_id}
+
+
 # ── 매매 일지 ──────────────────────────────────────────────────────────────────
+
+@router.get("/toss-balance")
+async def get_toss_balance() -> dict[str, Any]:
+    """토스증권 잔고 조회 (읽기전용)."""
+    import os
+    key     = os.getenv("TOSS_APP_KEY", "")
+    secret  = os.getenv("TOSS_APP_SECRET", "")
+    account = os.getenv("TOSS_ACCOUNT_NO", "")
+    if not all([key, secret, account]):
+        return {"available": False, "error": "토스 API 자격증명 없음 (.env 설정 필요)"}
+    try:
+        from core.broker.toss import TossBroker
+        broker = TossBroker()
+        if not broker.connect():
+            return {"available": False, "error": "토스 연결 실패"}
+        bal = broker.get_balance()
+        return {
+            "available": True,
+            "cash": bal.cash,
+            "total_equity": bal.total_equity,
+            "buying_power": bal.buying_power,
+            "currency": getattr(bal, "currency", "KRW"),
+        }
+    except Exception as e:
+        return {"available": False, "error": str(e)}
+
 
 @router.get("/journal")
 async def get_journal(days: int = 30) -> list[dict[str, Any]]:
@@ -374,4 +508,158 @@ async def get_journal(days: int = 30) -> list[dict[str, Any]]:
             "trades": trade_list,
         })
 
+    return result
+
+
+# ── 기기 간 DB 동기화 ───────────────────────────────────────────────────────────
+
+class SyncImportRequest(BaseModel):
+    trades: list[dict[str, Any]] = []
+    research: list[dict[str, Any]] = []
+
+
+@router.get("/sync/export")
+async def sync_export() -> dict[str, Any]:
+    """현재 기기의 매매일지 + 리서치 노트를 JSON으로 내보내기."""
+    from database.models import TradeRepository
+    from database.db import get_db
+    import socket
+
+    db = get_db()
+    repo = TradeRepository(db)
+
+    trades = repo.find_all(limit=10000)
+    trade_list = [
+        {
+            "symbol": t.symbol, "side": t.side, "order_type": t.order_type,
+            "quantity": t.quantity, "price": t.price,
+            "filled_qty": t.filled_qty, "filled_price": t.filled_price,
+            "order_id": t.order_id, "status": t.status,
+            "market": t.market, "strategy": t.strategy,
+            "pnl": t.pnl, "created_at": t.created_at,
+        }
+        for t in trades
+    ]
+
+    research_rows = db.execute("SELECT * FROM research_notes ORDER BY created_at", ())
+    research_list = [dict(r) for r in research_rows]
+
+    return {
+        "device": socket.gethostname(),
+        "exported_at": datetime.now().isoformat(timespec="seconds"),
+        "trade_count": len(trade_list),
+        "research_count": len(research_list),
+        "trades": trade_list,
+        "research": research_list,
+    }
+
+
+@router.post("/sync/import")
+async def sync_import(req: SyncImportRequest) -> dict[str, Any]:
+    """다른 기기의 매매일지 + 리서치 노트를 가져와서 병합 (중복 제거)."""
+    from database.db import get_db
+
+    db = get_db()
+    trade_added = 0
+    research_added = 0
+
+    # ── trades 병합 ─────────────────────────────────────────────────
+    existing_order_ids = {
+        row["order_id"]
+        for row in db.execute("SELECT order_id FROM trades WHERE order_id != ''", ())
+    }
+    existing_keys = {
+        (row["symbol"], row["side"], row["created_at"])
+        for row in db.execute("SELECT symbol, side, created_at FROM trades", ())
+    }
+
+    for t in req.trades:
+        oid = t.get("order_id", "")
+        key = (t.get("symbol", ""), t.get("side", ""), t.get("created_at", ""))
+        if (oid and oid in existing_order_ids) or (key in existing_keys):
+            continue
+        db.insert(
+            """INSERT INTO trades
+               (symbol, side, order_type, quantity, price,
+                filled_qty, filled_price, order_id, status,
+                market, strategy, pnl, created_at, updated_at)
+               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+            (
+                t.get("symbol", ""), t.get("side", ""), t.get("order_type", "MARKET"),
+                t.get("quantity", 0), t.get("price", 0),
+                t.get("filled_qty", 0), t.get("filled_price", 0),
+                oid, t.get("status", "FILLED"),
+                t.get("market", ""), t.get("strategy", ""),
+                t.get("pnl", 0), t.get("created_at", ""), t.get("created_at", ""),
+            ),
+        )
+        if oid:
+            existing_order_ids.add(oid)
+        existing_keys.add(key)
+        trade_added += 1
+
+    # ── research_notes 병합 ──────────────────────────────────────────
+    existing_research = {
+        (row["ticker"], row["created_at"])
+        for row in db.execute("SELECT ticker, created_at FROM research_notes", ())
+    }
+
+    for r in req.research:
+        rkey = (r.get("ticker", ""), r.get("created_at", ""))
+        if rkey in existing_research:
+            continue
+        db.insert(
+            """INSERT INTO research_notes
+               (ticker, source, rating, target_price, current_price,
+                summary, content, catalyst,
+                buy_tier_1, buy_tier_2, buy_tier_3, stop_price, horizon,
+                created_at, updated_at)
+               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+            (
+                r.get("ticker", ""), r.get("source", ""), r.get("rating", ""),
+                r.get("target_price", 0), r.get("current_price", 0),
+                r.get("summary", ""), r.get("content", ""), r.get("catalyst", ""),
+                r.get("buy_tier_1", 0), r.get("buy_tier_2", 0), r.get("buy_tier_3", 0),
+                r.get("stop_price", 0), r.get("horizon", ""),
+                r.get("created_at", ""), r.get("updated_at", ""),
+            ),
+        )
+        existing_research.add(rkey)
+        research_added += 1
+
+    return {
+        "status": "ok",
+        "trade_added": trade_added,
+        "research_added": research_added,
+    }
+
+
+@router.post("/sync/pull")
+async def sync_pull(body: dict[str, Any]) -> dict[str, Any]:
+    """상대 기기 URL에서 데이터를 직접 당겨와서 병합.
+
+    body: {"url": "http://192.168.x.x:8000"}
+    """
+    import httpx
+
+    peer_url = body.get("url", "").rstrip("/")
+    if not peer_url:
+        raise HTTPException(status_code=400, detail="url 필요 (예: http://192.168.1.10:8000)")
+
+    try:
+        async with httpx.AsyncClient(timeout=15) as client:
+            resp = await client.get(f"{peer_url}/api/sync/export")
+            resp.raise_for_status()
+            data = resp.json()
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"상대 기기 접속 실패: {e}")
+
+    req = SyncImportRequest(
+        trades=data.get("trades", []),
+        research=data.get("research", []),
+    )
+    result = await sync_import(req)
+    result["peer"] = data.get("device", peer_url)
+    result["peer_trades"] = data.get("trade_count", 0)
+    result["peer_research"] = data.get("research_count", 0)
     return result

@@ -13,6 +13,16 @@ from config.settings import TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID
 
 _app: Any = None
 
+# 허용된 chat_id만 명령 수신. TELEGRAM_CHAT_ID와 일치해야 함.
+def _is_authorized(update: Any) -> bool:
+    """발신자 chat_id가 설정된 TELEGRAM_CHAT_ID와 같은지 확인."""
+    if not TELEGRAM_CHAT_ID:
+        return False
+    try:
+        return str(update.effective_chat.id) == str(TELEGRAM_CHAT_ID)
+    except Exception:
+        return False
+
 
 def _get_app() -> Any:
     global _app
@@ -32,6 +42,7 @@ def _get_app() -> Any:
         _app.add_handler(CommandHandler("sell",      cmd_sell))
         _app.add_handler(CommandHandler("mode",      cmd_mode))
         _app.add_handler(CommandHandler("seed",      cmd_seed))
+        _app.add_handler(CommandHandler("journal",   cmd_journal))
         _app.add_handler(CommandHandler("help",      cmd_help))
         logger.info("[Telegram] 봇 핸들러 등록 완료")
     except Exception as e:
@@ -176,6 +187,8 @@ async def notify_positions(positions: list[dict[str, Any]]) -> None:
 
 
 async def cmd_status(update: Any, context: Any) -> None:
+    if not _is_authorized(update):
+        return
     try:
         from core.engine import TradingEngine
         engine = TradingEngine()
@@ -200,6 +213,8 @@ async def cmd_status(update: Any, context: Any) -> None:
 
 
 async def cmd_portfolio(update: Any, context: Any) -> None:
+    if not _is_authorized(update):
+        return
     try:
         from core.engine import TradingEngine
         engine = TradingEngine()
@@ -225,6 +240,8 @@ async def cmd_portfolio(update: Any, context: Any) -> None:
 
 
 async def cmd_stop(update: Any, context: Any) -> None:
+    if not _is_authorized(update):
+        return
     try:
         from core.engine import TradingEngine
         engine = TradingEngine()
@@ -238,6 +255,8 @@ async def cmd_stop(update: Any, context: Any) -> None:
 
 
 async def cmd_start(update: Any, context: Any) -> None:
+    if not _is_authorized(update):
+        return
     try:
         from core.engine import TradingEngine
         engine = TradingEngine()
@@ -251,6 +270,8 @@ async def cmd_start(update: Any, context: Any) -> None:
 
 
 async def cmd_watchlist(update: Any, context: Any) -> None:
+    if not _is_authorized(update):
+        return
     try:
         from core.engine import TradingEngine
         engine = TradingEngine()
@@ -270,6 +291,8 @@ async def cmd_watchlist(update: Any, context: Any) -> None:
 
 
 async def cmd_positions(update: Any, context: Any) -> None:
+    if not _is_authorized(update):
+        return
     try:
         from core.engine import TradingEngine
         engine = TradingEngine()
@@ -296,6 +319,8 @@ async def cmd_positions(update: Any, context: Any) -> None:
 
 async def cmd_sell(update: Any, context: Any) -> None:
     """/sell TICKER — 수동 즉시 매도."""
+    if not _is_authorized(update):
+        return
     try:
         from core.engine import TradingEngine
         engine = TradingEngine()
@@ -327,6 +352,8 @@ async def cmd_sell(update: Any, context: Any) -> None:
 
 async def cmd_mode(update: Any, context: Any) -> None:
     """/mode [MODE] — 매매 모드 조회 또는 변경."""
+    if not _is_authorized(update):
+        return
     try:
         from core.engine import TradingEngine, TRADING_MODE_CONFIG
         engine = TradingEngine()
@@ -358,6 +385,8 @@ async def cmd_mode(update: Any, context: Any) -> None:
 
 async def cmd_seed(update: Any, context: Any) -> None:
     """/seed — 현재 시드 및 누적 손익 조회."""
+    if not _is_authorized(update):
+        return
     try:
         import os
         from core.engine import TradingEngine, SEED_AMOUNT
@@ -382,12 +411,53 @@ async def cmd_seed(update: Any, context: Any) -> None:
         await update.message.reply_text(f"오류: {e}")
 
 
+async def cmd_journal(update: Any, context: Any) -> None:
+    """/journal — 오늘 + 최근 3일 매매 일지."""
+    if not _is_authorized(update):
+        return
+    try:
+        from database.models import TradeRepository
+        from database.db import get_db
+        import datetime as _dt
+
+        repo = TradeRepository(get_db())
+        lines = ["📒 <b>매매 일지 (최근 3일)</b>"]
+        today = _dt.date.today()
+        found = False
+        for i in range(3):
+            d = today - _dt.timedelta(days=i)
+            date_str = d.strftime("%Y-%m-%d")
+            trades = repo.find_by_date(date_str)
+            fills = [t for t in trades if t.status == "FILLED"]
+            if not fills:
+                continue
+            found = True
+            sells = [t for t in fills if t.side == "SELL"]
+            daily_pnl = sum(t.pnl for t in sells)
+            pnl_sign = "+" if daily_pnl >= 0 else ""
+            emoji = "🟢" if daily_pnl > 0 else ("🔴" if daily_pnl < 0 else "⚪")
+            lines.append(f"\n{emoji} <b>{date_str}</b> — {pnl_sign}{daily_pnl:,.0f}원")
+            for t in sorted(fills, key=lambda x: x.created_at):
+                side_kr = "매수" if t.side == "BUY" else "매도"
+                price_str = f"{t.filled_price or t.price:,.0f}" if (t.filled_price or t.price) < 100000 else f"${t.filled_price or t.price:,.2f}"
+                pnl_str = f" | {'+' if t.pnl > 0 else ''}{t.pnl:,.0f}원" if t.side == "SELL" and t.pnl != 0 else ""
+                lines.append(f"  {side_kr} {t.symbol} {t.quantity}주 @{price_str}{pnl_str}")
+        if not found:
+            lines.append("\n최근 3일 체결 기록 없음")
+        await update.message.reply_text("\n".join(lines), parse_mode="HTML")
+    except Exception as e:
+        await update.message.reply_text(f"오류: {e}")
+
+
 async def cmd_help(update: Any, context: Any) -> None:
+    if not _is_authorized(update):
+        return
     await update.message.reply_text(
         "📋 <b>사용 가능한 명령어</b>\n\n"
         "/status — 봇 상태 확인\n"
         "/positions — 보유 포지션 (손절/목표가 포함)\n"
         "/portfolio — 포트폴리오 요약\n"
+        "/journal — 최근 3일 매매 일지\n"
         "/sell 종목코드 — 즉시 매도 (예: /sell 005930)\n"
         "/mode — 현재 매매 모드 확인\n"
         "/mode day_trading — 모드 변경\n"
@@ -411,6 +481,99 @@ async def notify_nasdaq_open(positions: list[dict]) -> None:
             pnl = p.get("pnl_pct", 0)
             sign = "+" if pnl >= 0 else ""
             lines.append(f"  · {p['symbol']} {p['quantity']}주 ({sign}{pnl:.1f}%)")
+    await _send("\n".join(lines))
+
+
+async def notify_price_alert(
+    ticker: str,
+    name: str,
+    alert_type: str,
+    target_price: float,
+    current_price: float,
+    direction: str,
+    memo: str = "",
+) -> None:
+    now = datetime.now().strftime("%H:%M")
+    type_labels = {
+        "ABOVE": "🎯 목표가 도달 (매도 검토)",
+        "BELOW": "🛒 매수 목표가 도달",
+        "CHANGE_PCT": "⚡ 급등락 감지",
+    }
+    label = type_labels.get(alert_type, "📢 알림")
+    ticker_display = f"{ticker}" + (f" ({name})" if name else "")
+    lines = [
+        f"🔔 <b>{label}</b>",
+        f"종목: <code>{ticker_display}</code>",
+        f"현재가: <b>{current_price:,.2f}</b>",
+    ]
+    if target_price > 0:
+        lines.append(f"목표가: {target_price:,.2f}")
+    lines.append(f"조건: {direction}")
+    lines.append(f"시각: {now}")
+    if memo:
+        lines.append(f"메모: {memo}")
+    lines.append("👉 토스증권에서 확인하세요!")
+    await _send("\n".join(lines))
+
+
+async def notify_daily_orlando(market_data: dict) -> None:
+    """매일 아침 올랜도킴 종목 매수적정가 모니터링 리포트."""
+    try:
+        import sqlite3
+        db = sqlite3.connect("data/trading.db")
+        db.row_factory = sqlite3.Row
+        rows = db.execute(
+            "SELECT ticker, buy_tier_1, buy_tier_2, buy_tier_3, target_price, stop_price "
+            "FROM research_notes WHERE buy_tier_1 > 0 OR buy_tier_2 > 0 OR buy_tier_3 > 0"
+        ).fetchall()
+        db.close()
+    except Exception:
+        return
+
+    if not rows:
+        return
+
+    now = datetime.now().strftime("%m/%d %H:%M")
+    lines = [f"📊 <b>올랜도킴 매수 모니터링</b> ({now})", "─" * 22]
+
+    for row in rows:
+        ticker = row["ticker"]
+        current = market_data.get(ticker, {}).get("current_price", 0)
+        if current <= 0:
+            continue
+
+        is_os = ticker.isalpha() and not ticker.startswith("0")
+        fmt = lambda p: f"${p:,.2f}" if is_os else f"{p:,.0f}원"
+        cur_str = fmt(current)
+
+        tiers = [
+            (row["buy_tier_1"], "1차"),
+            (row["buy_tier_2"], "2차"),
+            (row["buy_tier_3"], "3차"),
+        ]
+
+        tier_lines = []
+        hit_any = False
+        for price, label in tiers:
+            if not price or price <= 0:
+                continue
+            pct = (current - price) / price * 100
+            if current <= price:
+                tier_lines.append(f"  ✅ {label} {fmt(price)} <b>매수구간!</b>")
+                hit_any = True
+            elif pct <= 5.0:
+                tier_lines.append(f"  ⚠️ {label} {fmt(price)} ({pct:.1f}% 남음)")
+            else:
+                tier_lines.append(f"  · {label} {fmt(price)} ({pct:.1f}% 남음)")
+
+        status = "🔴" if hit_any else "🟡" if any("⚠️" in t for t in tier_lines) else "🔵"
+        lines.append(f"{status} <b>{ticker}</b>  현재 {cur_str}")
+        lines.extend(tier_lines)
+        if row["target_price"] > 0:
+            lines.append(f"  🎯 목표 {fmt(row['target_price'])}")
+
+    lines.append("─" * 22)
+    lines.append("🔴=매수구간  🟡=5%이내  🔵=대기")
     await _send("\n".join(lines))
 
 

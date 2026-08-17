@@ -210,32 +210,40 @@ class DataFetcher:
 
     async def fetch_portfolio(self) -> dict[str, Any]:
         import os
-        seed = int(os.getenv("SEED_AMOUNT", "2000000"))
-        try:
-            balance = self._broker.get_balance()
-            total_value = balance.total_equity if balance.total_equity > 0 else seed
-            cash = balance.cash
-            invested = max(0.0, total_value - cash)
-            pnl_amount = total_value - seed
-            pnl_pct = round(pnl_amount / seed * 100, 2) if seed > 0 else 0.0
+        # INITIAL_SEED: 최초 투자 원금 (수익률 기준) — SEED_AMOUNT와 분리
+        initial_seed = int(os.getenv("INITIAL_SEED", os.getenv("SEED_AMOUNT", "2000000")))
+        current_seed = int(os.getenv("SEED_AMOUNT", "2000000"))
+
+        balance = self._broker.get_balance()
+        total_equity = balance.total_equity
+        cash = balance.cash
+
+        if total_equity > 0:
+            invested = max(0.0, total_equity - cash)
+            pnl_amount = total_equity - initial_seed
+            pnl_pct = round(pnl_amount / initial_seed * 100, 2) if initial_seed > 0 else 0.0
             return {
-                "total_value": total_value,
+                "total_value": total_equity,
                 "cash": cash,
                 "invested": round(invested, 0),
                 "pnl_amount": round(pnl_amount, 0),
                 "return_pct": pnl_pct,
-                "seed": seed,
+                "seed": initial_seed,
+                "current_seed": current_seed,
                 "api_error": False,
             }
-        except Exception as e:
-            logger.warning(f"[Fetcher] 포트폴리오 조회 실패: {e}")
+        else:
+            # 잔고 조회 실패 (장 외 시간 등) — 캐시된 포지션으로 추정
+            positions = await self.fetch_kis_positions()
+            invested = round(sum(p.get("value", 0) for p in positions), 0)
             return {
-                "total_value": seed,
-                "cash": seed,
-                "invested": 0,
+                "total_value": current_seed,
+                "cash": current_seed,
+                "invested": invested,
                 "pnl_amount": 0,
                 "return_pct": 0.0,
-                "seed": seed,
+                "seed": initial_seed,
+                "current_seed": current_seed,
                 "api_error": True,
             }
 
@@ -244,10 +252,13 @@ class DataFetcher:
         now = time.time()
         if _POSITIONS_CACHE and (now - _POSITIONS_CACHE[1]) < _POSITIONS_TTL:
             return _POSITIONS_CACHE[0]
+
+        result = []
+
+        # ── KOSPI 국내주식 잔고 ───────────────────────────────────────────
         try:
-            positions = self._broker.get_positions()
-            result = []
-            for p in positions:
+            kospi_positions = self._broker.get_positions()
+            for p in kospi_positions:
                 pnl_pct = 0.0
                 if p.avg_price > 0 and p.current_price > 0:
                     pnl_pct = round((p.current_price - p.avg_price) / p.avg_price * 100, 2)
@@ -262,11 +273,33 @@ class DataFetcher:
                     "stop_price": round(p.avg_price * 0.965, 0),
                     "target_price": round(p.avg_price * 1.06, 0),
                 })
-            _POSITIONS_CACHE = (result, now)
-            return result
         except Exception as e:
-            logger.warning(f"[Fetcher] KIS 포지션 조회 실패: {e}")
-            return _POSITIONS_CACHE[0] if _POSITIONS_CACHE else []
+            logger.debug(f"[Fetcher] KOSPI 포지션 조회 실패: {e}")
+
+        # ── NASDAQ/NYSE 해외주식 잔고 ────────────────────────────────────
+        try:
+            overseas_positions = self._broker.get_overseas_positions()
+            for p in overseas_positions:
+                pnl_pct = 0.0
+                if p.avg_price > 0 and p.current_price > 0:
+                    pnl_pct = round((p.current_price - p.avg_price) / p.avg_price * 100, 2)
+                result.append({
+                    "symbol": p.symbol,
+                    "quantity": p.quantity,
+                    "avg_price": p.avg_price,
+                    "current_price": p.current_price,
+                    "value": round(p.current_price * p.quantity, 0),
+                    "pnl_pct": pnl_pct,
+                    "market": "NASDAQ",
+                    "stop_price": round(p.avg_price * 0.965, 2),
+                    "target_price": round(p.avg_price * 1.06, 2),
+                })
+        except Exception as e:
+            logger.debug(f"[Fetcher] 해외주식 포지션 조회 실패: {e}")
+
+        if result or not _POSITIONS_CACHE:
+            _POSITIONS_CACHE = (result, now)
+        return _POSITIONS_CACHE[0] if _POSITIONS_CACHE else []
 
     @staticmethod
     def _dummy(symbol: str) -> dict[str, Any]:

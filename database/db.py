@@ -15,11 +15,28 @@ class Database:
         self.db_path = Path(db_path)
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
         self._init_schema()
+        self._migrate_schema()
         logger.info(f"[DB] 초기화 완료: {self.db_path.resolve()}")
 
     def _init_schema(self) -> None:
         with self.connection() as conn:
             conn.executescript(_SCHEMA_SQL)
+
+    def _migrate_schema(self) -> None:
+        """컬럼 추가 마이그레이션 (이미 있으면 무시)."""
+        migrations = [
+            "ALTER TABLE research_notes ADD COLUMN buy_tier_1 REAL DEFAULT 0",
+            "ALTER TABLE research_notes ADD COLUMN buy_tier_2 REAL DEFAULT 0",
+            "ALTER TABLE research_notes ADD COLUMN buy_tier_3 REAL DEFAULT 0",
+            "ALTER TABLE research_notes ADD COLUMN stop_price REAL DEFAULT 0",
+            "ALTER TABLE research_notes ADD COLUMN horizon TEXT DEFAULT ''",
+        ]
+        with self.connection() as conn:
+            for sql in migrations:
+                try:
+                    conn.execute(sql)
+                except Exception:
+                    pass  # column already exists
 
     @contextmanager
     def connection(self) -> Generator[sqlite3.Connection, None, None]:
@@ -121,6 +138,28 @@ CREATE INDEX IF NOT EXISTS idx_signals_symbol   ON signals(symbol);
 CREATE INDEX IF NOT EXISTS idx_signals_created  ON signals(created_at);
 CREATE INDEX IF NOT EXISTS idx_research_ticker  ON research_notes(ticker);
 CREATE INDEX IF NOT EXISTS idx_research_created ON research_notes(created_at);
+
+CREATE TABLE IF NOT EXISTS price_alerts (
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    ticker       TEXT    NOT NULL,
+    name         TEXT    NOT NULL DEFAULT '',
+    alert_type   TEXT    NOT NULL CHECK(alert_type IN ('ABOVE','BELOW','CHANGE_PCT')),
+    target_price REAL    NOT NULL DEFAULT 0,
+    change_pct   REAL    NOT NULL DEFAULT 0,
+    memo         TEXT    NOT NULL DEFAULT '',
+    active       INTEGER NOT NULL DEFAULT 1,
+    triggered    INTEGER NOT NULL DEFAULT 0,
+    triggered_at TEXT    DEFAULT NULL,
+    created_at   TEXT    NOT NULL DEFAULT (datetime('now','localtime'))
+);
+
+CREATE INDEX IF NOT EXISTS idx_alerts_ticker ON price_alerts(ticker);
+CREATE INDEX IF NOT EXISTS idx_alerts_active ON price_alerts(active);
+
+CREATE TABLE IF NOT EXISTS daily_loss (
+    date TEXT PRIMARY KEY,
+    loss REAL NOT NULL DEFAULT 0.0
+);
 """
 
 

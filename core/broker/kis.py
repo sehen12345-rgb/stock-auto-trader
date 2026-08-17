@@ -63,6 +63,10 @@ class KISBroker(BaseBroker):
     TR_OVERSEAS_BALANCE_REAL = "TTTS3012R"
     TR_OVERSEAS_BALANCE_MOCK = "VTTS3012R"
 
+    # 클래스 공유 rate limiter — 모든 인스턴스 합산 (EGW00201 방지)
+    _class_last_api_call: float = 0.0
+    _class_api_interval: float = 1.05  # 초당 1회 미만
+
     def __init__(
         self,
         app_key: str = KIS_APP_KEY,
@@ -78,7 +82,7 @@ class KISBroker(BaseBroker):
         self.base_url = self.MOCK_BASE if mock else self.REAL_BASE
 
         self._access_token: str = ""
-        self._token_expires_at: datetime = datetime.min
+        self._token_expires_at: datetime = datetime(2000, 1, 1)  # 안전한 과거값 (datetime.min은 OverflowError 유발)
 
         self._session = requests.Session()
         self._session.headers.update({"Content-Type": "application/json; charset=utf-8"})
@@ -86,14 +90,19 @@ class KISBroker(BaseBroker):
     # ── 연결 ────────────────────────────────────────────────────────────
 
     def connect(self) -> bool:
-        try:
-            self._issue_token()
-            self._connected = True
-            logger.info(f"[KIS] 연결 성공 ({'모의' if self.mock else '실전'})")
-            return True
-        except Exception as exc:
-            logger.error(f"[KIS] 연결 실패: {exc}")
-            return False
+        for attempt in range(3):
+            try:
+                self._issue_token()
+                self._connected = True
+                logger.info(f"[KIS] 연결 성공 ({'모의' if self.mock else '실전'})")
+                return True
+            except Exception as exc:
+                logger.warning(f"[KIS] 연결 실패 (시도 {attempt+1}/3): {exc}")
+                if attempt < 2:
+                    import time as _t
+                    _t.sleep(3 * (attempt + 1))
+        logger.error("[KIS] 연결 최종 실패 — 봇 계속 실행하되 주문 불가")
+        return False
 
     def disconnect(self) -> None:
         self._session.close()
@@ -158,8 +167,18 @@ class KISBroker(BaseBroker):
                 os.remove(self._TOKEN_CACHE)
             self._issue_token()
 
+    def _rate_limit(self) -> None:
+        """클래스 공유 rate limiter — EGW00201(초당 거래횟수 초과) 방지."""
+        import time as _t
+        now = _t.monotonic()
+        wait = KISBroker._class_api_interval - (now - KISBroker._class_last_api_call)
+        if wait > 0:
+            _t.sleep(wait)
+        KISBroker._class_last_api_call = _t.monotonic()
+
     def _headers(self, tr_id: str, extra: dict | None = None) -> dict:
         self._ensure_token()
+        self._rate_limit()
         h = {
             "appkey": self.app_key,
             "appsecret": self.app_secret,
@@ -168,6 +187,40 @@ class KISBroker(BaseBroker):
         if extra:
             h.update(extra)
         return h
+
+    # ── 환율 ────────────────────────────────────────────────────────────
+
+    _usd_krw_cache: float = 0.0
+    _usd_krw_ts: float = 0.0
+    _USD_KRW_TTL: float = 600.0  # 10분 캐시
+
+    def get_usd_krw_rate(self) -> float:
+        """USD/KRW 실시간 환율 조회 (10분 캐시). 실패 시 환경변수 fallback."""
+        import time as _t
+        now = _t.monotonic()
+        if KISBroker._usd_krw_cache > 0 and (now - KISBroker._usd_krw_ts) < KISBroker._USD_KRW_TTL:
+            return KISBroker._usd_krw_cache
+        try:
+            # KIS 해외주식 현재가 API로 USD/KRW 환율 역산
+            # 기준: USDKRW FX 시세 (TR: FHDFS00000300)
+            url = f"{self.base_url}/uapi/overseas-price/v1/quotations/price"
+            params = {"AUTH": "", "EXCD": "FX", "SYMB": "USDKRW"}
+            resp = self._session.get(url, params=params,
+                                     headers=self._headers("HHDFS00000300"), timeout=5)
+            resp.raise_for_status()
+            data = resp.json()
+            rate = float(data.get("output", {}).get("last", 0))
+            if rate > 0:
+                KISBroker._usd_krw_cache = rate
+                KISBroker._usd_krw_ts = now
+                logger.debug(f"[KIS] USD/KRW 환율: {rate:,.2f}")
+                return rate
+        except Exception as e:
+            logger.debug(f"[KIS] 환율 조회 실패, fallback 사용: {e}")
+        fallback = float(os.getenv("USD_KRW_RATE", "1380"))
+        KISBroker._usd_krw_cache = fallback
+        KISBroker._usd_krw_ts = now
+        return fallback
 
     # ── 시세 ────────────────────────────────────────────────────────────
 
@@ -225,38 +278,80 @@ class KISBroker(BaseBroker):
     # ── 계좌 ────────────────────────────────────────────────────────────
 
     def get_balance(self) -> AccountBalance:
-        tr_id = self.TR_BALANCE_MOCK if self.mock else self.TR_BALANCE_REAL
-        url = f"{self.base_url}/uapi/domestic-stock/v1/trading/inquire-balance"
+        """국내 + 해외 잔고를 합산해 반환. 장 외 시간에도 최대한 조회한다."""
         acc_no, acc_suffix = self._split_account()
-        params = {
-            "CANO": acc_no,
-            "ACNT_PRDT_CD": acc_suffix,
-            "AFHR_FLPR_YN": "N",
-            "OFL_YN": "",
-            "INQR_DVSN": "02",
-            "UNPR_DVSN": "01",
-            "FUND_STTL_ICLD_YN": "N",
-            "FNCG_AMT_AUTO_RDPT_YN": "N",
-            "PRCS_DVSN": "01",
-            "CTX_AREA_FK100": "",
-            "CTX_AREA_NK100": "",
-        }
-        resp = self._session.get(
-            url, params=params, headers=self._headers(tr_id), timeout=10
-        )
-        resp.raise_for_status()
-        data = resp.json()
-        output2 = data.get("output2", [{}])[0]
+
+        # ── 국내 잔고 (KRW) ───────────────────────────────────────────────
+        krw_cash = 0.0
+        krw_equity = 0.0
+        krw_buying_power = 0.0
+        raw_domestic: dict = {}
+        try:
+            tr_id = self.TR_BALANCE_MOCK if self.mock else self.TR_BALANCE_REAL
+            url = f"{self.base_url}/uapi/domestic-stock/v1/trading/inquire-balance"
+            params = {
+                "CANO": acc_no,
+                "ACNT_PRDT_CD": acc_suffix,
+                "AFHR_FLPR_YN": "N",
+                "OFL_YN": "",
+                "INQR_DVSN": "02",
+                "UNPR_DVSN": "01",
+                "FUND_STTL_ICLD_YN": "N",
+                "FNCG_AMT_AUTO_RDPT_YN": "N",
+                "PRCS_DVSN": "01",
+                "CTX_AREA_FK100": "",
+                "CTX_AREA_NK100": "",
+            }
+            resp = self._session.get(url, params=params, headers=self._headers(tr_id), timeout=10)
+            resp.raise_for_status()
+            output2 = resp.json().get("output2", [{}])[0]
+            krw_cash = float(output2.get("dnca_tot_amt", 0))
+            krw_equity = float(output2.get("tot_evlu_amt", 0))
+            krw_buying_power = float(output2.get("prvs_rcdl_excc_amt", 0))
+            raw_domestic = output2
+        except Exception as e:
+            logger.debug(f"[KIS] 국내 잔고 조회 불가 (장 외 시간일 수 있음): {e}")
+
+        # ── 해외 잔고 (USD → KRW 환산) ──────────────────────────────────
+        usd_total = 0.0
+        try:
+            tr_id_os = self.TR_OVERSEAS_BALANCE_MOCK if self.mock else self.TR_OVERSEAS_BALANCE_REAL
+            url_os = f"{self.base_url}/uapi/overseas-stock/v1/trading/inquire-balance"
+            for excd in ("NAS", "NYS"):
+                params_os = {
+                    "CANO": acc_no,
+                    "ACNT_PRDT_CD": acc_suffix,
+                    "OVRS_EXCG_CD": excd,
+                    "TR_CRCY_CD": "USD",
+                    "CTX_AREA_FK200": "",
+                    "CTX_AREA_NK200": "",
+                }
+                resp_os = self._session.get(url_os, params=params_os, headers=self._headers(tr_id_os), timeout=10)
+                resp_os.raise_for_status()
+                data_os = resp_os.json()
+                output2_os = data_os.get("output2", {})
+                if isinstance(output2_os, list):
+                    output2_os = output2_os[0] if output2_os else {}
+                usd_total += float(output2_os.get("tot_evlu_pfls_amt2", 0) or 0)
+        except Exception as e:
+            logger.debug(f"[KIS] 해외 잔고 조회 불가: {e}")
+
+        usd_krw = self.get_usd_krw_rate()
+        usd_in_krw = round(usd_total * usd_krw, 0)
+
+        total_equity = (krw_equity or krw_cash) + usd_in_krw
+        total_cash = krw_cash + usd_in_krw
 
         return AccountBalance(
-            cash=float(output2.get("dnca_tot_amt", 0)),
-            total_equity=float(output2.get("tot_evlu_amt", 0)),
-            buying_power=float(output2.get("prvs_rcdl_excc_amt", 0)),
+            cash=total_cash,
+            total_equity=total_equity,
+            buying_power=krw_buying_power,
             currency="KRW",
-            raw=output2,
+            raw=raw_domestic,
         )
 
     def get_positions(self) -> list[Position]:
+        """KOSPI 국내주식 보유 잔고 조회. 장 외 시간에는 빈 리스트 반환."""
         tr_id = self.TR_BALANCE_MOCK if self.mock else self.TR_BALANCE_REAL
         url = f"{self.base_url}/uapi/domestic-stock/v1/trading/inquire-balance"
         acc_no, acc_suffix = self._split_account()
@@ -273,10 +368,15 @@ class KISBroker(BaseBroker):
             "CTX_AREA_FK100": "",
             "CTX_AREA_NK100": "",
         }
-        resp = self._session.get(
-            url, params=params, headers=self._headers(tr_id), timeout=10
-        )
-        resp.raise_for_status()
+        try:
+            resp = self._session.get(
+                url, params=params, headers=self._headers(tr_id), timeout=10
+            )
+            resp.raise_for_status()
+        except Exception as e:
+            # KIS는 장 외 시간에 domestic balance API가 500 반환 — 정상 동작
+            logger.debug(f"[KIS] 국내주식 잔고 조회 불가 (장 외 시간일 수 있음): {e}")
+            return []
         data = resp.json()
         output1 = data.get("output1", [])
 
@@ -294,6 +394,46 @@ class KISBroker(BaseBroker):
                     market="KOSPI",
                 )
             )
+        return positions
+
+    def get_overseas_positions(self) -> list[Position]:
+        """NASDAQ/NYSE 해외주식 보유 잔고 조회 (TTTS3012R)."""
+        tr_id = self.TR_OVERSEAS_BALANCE_MOCK if self.mock else self.TR_OVERSEAS_BALANCE_REAL
+        url = f"{self.base_url}/uapi/overseas-stock/v1/trading/inquire-balance"
+        acc_no, acc_suffix = self._split_account()
+
+        positions = []
+        # 거래소별로 조회 (NASD, NYSE)
+        for excd in ("NAS", "NYS"):
+            params = {
+                "CANO": acc_no,
+                "ACNT_PRDT_CD": acc_suffix,
+                "OVRS_EXCG_CD": excd,
+                "TR_CRCY_CD": "USD",
+                "CTX_AREA_FK200": "",
+                "CTX_AREA_NK200": "",
+            }
+            try:
+                resp = self._session.get(
+                    url, params=params, headers=self._headers(tr_id), timeout=10
+                )
+                resp.raise_for_status()
+                data = resp.json()
+                for item in data.get("output1", []):
+                    qty = int(item.get("ovrs_cblc_qty", 0))
+                    if qty <= 0:
+                        continue
+                    positions.append(
+                        Position(
+                            symbol=item.get("ovrs_pdno", ""),
+                            quantity=qty,
+                            avg_price=float(item.get("pchs_avg_pric", 0)),
+                            current_price=float(item.get("now_pric2", 0)),
+                            market="NASDAQ",
+                        )
+                    )
+            except Exception as e:
+                logger.debug(f"[KIS] 해외주식 잔고 조회 불가 ({excd}): {e}")
         return positions
 
     # ── 주문 ────────────────────────────────────────────────────────────
@@ -477,6 +617,137 @@ class KISBroker(BaseBroker):
 
         return orders
 
+    def get_order_history(self, days: int = 30) -> list[Order]:
+        """당일 국내주식 체결 이력 조회 (KIS API는 당일만 지원)."""
+        tr_id = self.TR_ORDER_LIST_MOCK if self.mock else self.TR_ORDER_LIST_REAL
+        url = f"{self.base_url}/uapi/domestic-stock/v1/trading/inquire-daily-ccld"
+        acc_no, acc_suffix = self._split_account()
+        today = datetime.now().strftime("%Y%m%d")
+
+        params = {
+            "CANO": acc_no,
+            "ACNT_PRDT_CD": acc_suffix,
+            "INQR_STRT_DT": today,
+            "INQR_END_DT": today,
+            "SLL_BUY_DVSN_CD": "00",
+            "INQR_DVSN": "00",
+            "PDNO": "",
+            "CCLD_DVSN": "00",
+            "ORD_GNO_BRNO": "",
+            "ODNO": "",
+            "INQR_DVSN_3": "00",
+            "INQR_DVSN_1": "",
+            "CTX_AREA_FK100": "",
+            "CTX_AREA_NK100": "",
+        }
+        try:
+            resp = self._session.get(
+                url, params=params, headers=self._headers(tr_id), timeout=10
+            )
+            resp.raise_for_status()
+            data = resp.json()
+            if data.get("rt_cd") != "0":
+                logger.debug(f"[KIS] 당일 체결 이력 조회 실패: {data.get('msg1', '')}")
+                return []
+            output1 = data.get("output1") or []
+            orders: list[Order] = []
+            for item in output1:
+                filled_qty = int(item.get("tot_ccld_qty", 0))
+                if filled_qty <= 0:
+                    continue
+                side_code = item.get("sll_buy_dvsn_cd", "02")
+                side = OrderSide.BUY if side_code == "02" else OrderSide.SELL
+                ord_dvsn = item.get("ord_dvsn_cd", "01")
+                o_type = OrderType.MARKET if ord_dvsn == "01" else OrderType.LIMIT
+                ccld_time = item.get("ccld_cnfm_tm", "") or ""
+                if len(ccld_time) >= 6:
+                    created_at = f"{datetime.now().strftime('%Y-%m-%d')}T{ccld_time[:2]}:{ccld_time[2:4]}:{ccld_time[4:6]}"
+                else:
+                    created_at = datetime.now().strftime("%Y-%m-%dT09:00:00")
+                o = Order(
+                    symbol=item.get("pdno", ""),
+                    side=side,
+                    order_type=o_type,
+                    quantity=int(item.get("ord_qty", 0)),
+                    price=float(item.get("ord_unpr", 0)),
+                    order_id=item.get("odno", ""),
+                    status=OrderStatus.FILLED,
+                    filled_qty=filled_qty,
+                    filled_price=float(item.get("avg_prvs", 0)),
+                    raw={**item, "_created_at": created_at, "_market": "KOSPI"},
+                )
+                orders.append(o)
+            return orders
+        except Exception as e:
+            logger.debug(f"[KIS] 당일 체결 이력 조회 실패: {e}")
+            return []
+
+    def get_overseas_order_history(self) -> list[Order]:
+        """당일 해외주식 체결 이력 조회 (NASD + NYSE)."""
+        TR_REAL = "TTTS3035R"
+        TR_MOCK = "VTTS3035R"
+        tr_id = TR_MOCK if self.mock else TR_REAL
+        url = f"{self.base_url}/uapi/overseas-stock/v1/trading/inquire-ccnl"
+        acc_no, acc_suffix = self._split_account()
+        today = datetime.now().strftime("%Y%m%d")
+
+        orders: list[Order] = []
+        for excd in ("NASD", "NYSE"):
+            params = {
+                "CANO": acc_no,
+                "ACNT_PRDT_CD": acc_suffix,
+                "PDNO": "",
+                "ORD_STRT_DT": today,
+                "ORD_END_DT": today,
+                "SLL_BUY_DVSN": "00",
+                "CCLD_NCCS_DVSN": "01",   # 체결만
+                "OVRS_EXCG_CD": excd,
+                "SORT_SQN": "DS",
+                "ORD_DT": "",
+                "CTX_AREA_NK200": "",
+                "CTX_AREA_FK200": "",
+            }
+            try:
+                resp = self._session.get(
+                    url, params=params, headers=self._headers(tr_id), timeout=10
+                )
+                resp.raise_for_status()
+                data = resp.json()
+                if data.get("rt_cd") != "0":
+                    logger.debug(f"[KIS] 해외 체결 이력 조회 실패 ({excd}): {data.get('msg1', '')}")
+                    continue
+                for item in (data.get("output") or []):
+                    filled_qty = int(item.get("ft_ccld_qty", 0))
+                    if filled_qty <= 0:
+                        continue
+                    side_code = item.get("sll_buy_dvsn_cd", "02")
+                    side = OrderSide.BUY if side_code == "02" else OrderSide.SELL
+                    ord_time = item.get("ord_tmd", "") or ""
+                    if len(ord_time) >= 6:
+                        created_at = (
+                            f"{datetime.now().strftime('%Y-%m-%d')}"
+                            f"T{ord_time[:2]}:{ord_time[2:4]}:{ord_time[4:6]}"
+                        )
+                    else:
+                        created_at = datetime.now().strftime("%Y-%m-%dT22:30:00")
+                    market = "NYSE" if excd == "NYSE" else "NASDAQ"
+                    orders.append(Order(
+                        symbol=item.get("pdno", ""),
+                        side=side,
+                        order_type=OrderType.MARKET,
+                        quantity=int(item.get("ft_ord_qty", 0)),
+                        price=float(item.get("ft_ccld_unpr3", 0)),
+                        order_id=item.get("odno", ""),
+                        status=OrderStatus.FILLED,
+                        filled_qty=filled_qty,
+                        filled_price=float(item.get("ft_ccld_unpr3", 0)),
+                        raw={**item, "_created_at": created_at, "_market": market},
+                    ))
+            except Exception as e:
+                logger.debug(f"[KIS] 해외 체결 이력 조회 실패 ({excd}): {e}")
+
+        return orders
+
     # ── 해외주식 ─────────────────────────────────────────────────────────
 
     @staticmethod
@@ -487,7 +758,16 @@ class KISBroker(BaseBroker):
     @staticmethod
     def _get_exchange(symbol: str) -> str:
         """티커별 거래소 코드 반환. 기본 NASDAQ."""
-        nyse = {"BRK", "JPM", "BAC", "GS", "MS", "WMT", "CAT", "GE", "GEV", "LLY", "UNH"}
+        nyse = {
+            # 기존 NYSE
+            "BRK", "JPM", "BAC", "GS", "MS", "WMT", "CAT", "GE", "GEV", "LLY", "UNH",
+            # 추가: 관심 종목 중 NYSE 상장
+            "TSM",   # TSMC ADR — NYSE
+            "VRT",   # Vertiv — NYSE
+            "DELL",  # Dell Technologies — NYSE
+            "BE",    # Bloom Energy — NYSE
+        }
+        # DDOG, NVDA, AVGO, MU, AMD, MRVL, AMZN, MSFT, GOOG, TSLA, PLTR, IONQ → NASDAQ (기본값)
         return "NYS" if symbol.upper() in nyse else "NAS"
 
     def get_overseas_price(self, symbol: str) -> float:
@@ -541,7 +821,7 @@ class KISBroker(BaseBroker):
                 df.set_index("date", inplace=True)
             return df
         except Exception as e:
-            logger.warning(f"[KIS] {symbol} 해외 OHLCV 조회 실패: {e}")
+            logger.debug(f"[KIS] {symbol} 해외 OHLCV 조회 불가 (장 외 또는 미지원 종목): {e}")
             return pd.DataFrame()
 
     def buy_overseas_market(self, symbol: str, quantity: int) -> Order:
