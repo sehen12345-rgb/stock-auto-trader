@@ -168,6 +168,12 @@ class TradingEngine:
         asyncio.create_task(_safe(self._sync_positions_on_start()))
         # KIS 체결 이력 → 로컬 DB 동기화 (기기 간 매매일지 일치)
         asyncio.create_task(_safe(self._sync_trade_history_from_kis()))
+        # KIS WebSocket 실시간 시세 구독 (국내주식)
+        if not KIS_MOCK and not DEMO_MODE:
+            domestic = [s for s in self._watchlist if s.isdigit()]
+            if domestic:
+                from core import kis_ws
+                asyncio.create_task(kis_ws.start(domestic))
         from notifications.telegram_bot import notify_start
         asyncio.create_task(_safe(notify_start()))
 
@@ -192,6 +198,11 @@ class TradingEngine:
             t.cancel()
         if tasks:
             await asyncio.gather(*tasks, return_exceptions=True)
+        try:
+            from core import kis_ws
+            await kis_ws.stop()
+        except Exception:
+            pass
         logger.info("[Engine] 봇 중지")
         from notifications.telegram_bot import notify_stop
         await _safe(notify_stop())
@@ -413,12 +424,17 @@ class TradingEngine:
             for ticker in tickers:
                 market_data[ticker] = get_demo_ticker(ticker)
         else:
-            for ticker in tickers:
+            async def _safe_fetch(t: str) -> tuple[str, Any]:
                 try:
-                    data = await self.fetcher.fetch(ticker)
-                    market_data[ticker] = data
+                    return t, await self.fetcher.fetch(t)
                 except Exception as e:
-                    logger.warning(f"[Engine] {ticker} 시세 조회 실패: {e}")
+                    logger.warning(f"[Engine] {t} 시세 조회 실패: {e}")
+                    return t, None
+
+            results = await asyncio.gather(*[_safe_fetch(t) for t in tickers])
+            for ticker, data in results:
+                if data is not None:
+                    market_data[ticker] = data
 
         # 올랜도킴 리포트용 최신 시세 저장
         self._last_market_data = market_data
@@ -1242,13 +1258,30 @@ class TradingEngine:
                             limit_price = int(current_price * 0.999)
                             entry_reason = f"모멘텀 -0.1% 지정가"
 
-                        # 조건부지정가: 당일 미체결 시 장마감(15:20) 직전 시장가 자동 전환
-                        # → 체결 기회 최대화 + 가격 개선 시도 동시에
-                        order = broker.buy_conditional(ticker, qty, limit_price)
-                        logger.info(
-                            f"[Engine] 조건부지정가 매수: {ticker} {qty}주 @ {limit_price:,}원 "
-                            f"({entry_reason}) | 미체결 시 15:20 시장가 전환"
-                        )
+                        # VWAP 분할매수: qty >= 2이면 60/40으로 쪼개 체결 품질 향상
+                        if qty >= 2 and vwap > 0:
+                            qty1 = max(1, round(qty * 0.6))
+                            qty2 = qty - qty1
+                            # 1차: 즉시 조건부지정가
+                            order = broker.buy_conditional(ticker, qty1, limit_price)
+                            logger.info(
+                                f"[Engine] VWAP 분할매수 1차: {ticker} {qty1}주 @ {limit_price:,}원 ({entry_reason})"
+                            )
+                            # 2차: VWAP 이하 지정가 (가격 개선 목적)
+                            if qty2 > 0:
+                                vwap_limit = int(min(limit_price, vwap) * 0.999)
+                                asyncio.create_task(_safe(
+                                    _delayed_buy(broker, ticker, qty2, vwap_limit, 3)
+                                ))
+                                logger.info(
+                                    f"[Engine] VWAP 분할매수 2차: {ticker} {qty2}주 @ {vwap_limit:,}원 (3초 후)"
+                                )
+                        else:
+                            order = broker.buy_conditional(ticker, qty, limit_price)
+                            logger.info(
+                                f"[Engine] 조건부지정가 매수: {ticker} {qty}주 @ {limit_price:,}원 "
+                                f"({entry_reason}) | 미체결 시 15:20 시장가 전환"
+                            )
 
                 from core.broker.kis import OrderStatus as KOrderStatus
                 if order.status == KOrderStatus.REJECTED:
@@ -1700,3 +1733,13 @@ async def _safe(coro: Any) -> None:
         await coro
     except Exception as e:
         logger.warning(f"[Engine] 알림 실패: {e}")
+
+
+async def _delayed_buy(broker: Any, symbol: str, qty: int, price: int, delay: float) -> None:
+    """delay초 후 지정가 매수 주문 (VWAP 분할매수 2차)."""
+    await asyncio.sleep(delay)
+    try:
+        broker.buy_conditional(symbol, qty, price)
+        logger.info(f"[Engine] VWAP 분할매수 2차 체결: {symbol} {qty}주 @ {price:,}원")
+    except Exception as e:
+        logger.warning(f"[Engine] VWAP 2차 주문 실패 {symbol}: {e}")

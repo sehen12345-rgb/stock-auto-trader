@@ -1,3 +1,4 @@
+import asyncio
 import time
 from datetime import datetime, timedelta
 from typing import Any
@@ -31,7 +32,7 @@ class DataFetcher:
 
     async def fetch(self, symbol: str) -> dict[str, Any]:
         try:
-            return self._fetch_sync(symbol)
+            return await asyncio.to_thread(self._fetch_sync, symbol)
         except Exception as e:
             logger.warning(f"[Fetcher] {symbol} 조회 실패 (더미 반환): {e}")
             return self._dummy(symbol)
@@ -68,14 +69,21 @@ class DataFetcher:
             return pd.DataFrame()
 
     def _fetch_sync(self, symbol: str) -> dict[str, Any]:
+        from core.kis_ws import get_live_price
         is_overseas = self._broker._is_overseas(symbol)
         if is_overseas:
             current_price = self._broker.get_overseas_price(symbol)
-            time.sleep(0.5)
+            time.sleep(0.3)
             df = self._get_ohlcv_cached(symbol, True)
         else:
-            current_price = self._broker.get_current_price(symbol)
-            time.sleep(0.5)
+            # WebSocket 캐시 우선 — 없으면 REST 폴링
+            live = get_live_price(symbol)
+            if live:
+                current_price = live
+                logger.debug(f"[Fetcher] {symbol} WS 캐시 사용: {live:,.0f}")
+            else:
+                current_price = self._broker.get_current_price(symbol)
+                time.sleep(0.3)
             df = self._get_ohlcv_cached(symbol, False)
 
         closes = df["close"].tolist() if not df.empty else []
