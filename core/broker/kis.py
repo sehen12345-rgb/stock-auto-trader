@@ -66,6 +66,8 @@ class KISBroker(BaseBroker):
     # 클래스 공유 rate limiter — 모든 인스턴스 합산 (EGW00201 방지)
     _class_last_api_call: float = 0.0
     _class_api_interval: float = 1.05  # 초당 1회 미만
+    # 해외주식 주문불가 텔레그램 알림 (중복 방지 — 세션당 1회만)
+    _overseas_blocked_notified: bool = False
 
     def __init__(
         self,
@@ -314,6 +316,7 @@ class KISBroker(BaseBroker):
 
         # ── 해외 잔고 (USD → KRW 환산) ──────────────────────────────────
         usd_total = 0.0
+        usd_available = 0.0  # 실제 주문가능 USD
         try:
             tr_id_os = self.TR_OVERSEAS_BALANCE_MOCK if self.mock else self.TR_OVERSEAS_BALANCE_REAL
             url_os = f"{self.base_url}/uapi/overseas-stock/v1/trading/inquire-balance"
@@ -332,9 +335,14 @@ class KISBroker(BaseBroker):
                 output2_os = data_os.get("output2", {})
                 if isinstance(output2_os, list):
                     output2_os = output2_os[0] if output2_os else {}
-                usd_total += float(output2_os.get("tot_evlu_pfls_amt2", 0) or 0)
+                # tot_evlu_pfls_amt: 총평가손익금액 (보유주식 평가)
+                usd_total += float(output2_os.get("tot_evlu_pfls_amt", 0) or 0)
+                # frcr_buy_amt_smtl1: 외화매수금액 합계 → 주문가능 가용 USD
+                usd_available += float(output2_os.get("frcr_buy_amt_smtl1", 0) or 0)
         except Exception as e:
             logger.debug(f"[KIS] 해외 잔고 조회 불가: {e}")
+
+        self._usd_available = usd_available  # 엔진에서 참조용
 
         usd_krw = self.get_usd_krw_rate()
         usd_in_krw = round(usd_total * usd_krw, 0)
@@ -450,6 +458,14 @@ class KISBroker(BaseBroker):
     def sell_limit(self, symbol: str, quantity: int, price: float) -> Order:
         return self._place_order(symbol, OrderSide.SELL, OrderType.LIMIT, quantity, price)
 
+    def buy_conditional(self, symbol: str, quantity: int, price: float) -> Order:
+        """조건부지정가 매수: 지정가로 접수, 당일 미체결 시 장마감 직전 시장가 자동 전환."""
+        return self._place_order(symbol, OrderSide.BUY, OrderType.CONDITIONAL, quantity, price)
+
+    def sell_conditional(self, symbol: str, quantity: int, price: float) -> Order:
+        """조건부지정가 매도."""
+        return self._place_order(symbol, OrderSide.SELL, OrderType.CONDITIONAL, quantity, price)
+
     def _place_order(
         self,
         symbol: str,
@@ -466,8 +482,15 @@ class KISBroker(BaseBroker):
         url = f"{self.base_url}/uapi/domestic-stock/v1/trading/order-cash"
         acc_no, acc_suffix = self._split_account()
 
-        # 주문 구분: 00=지정가, 01=시장가
-        ord_dvsn = "01" if order_type == OrderType.MARKET else "00"
+        # 주문 구분
+        # 00=지정가, 01=시장가, 03=조건부지정가(당일 미체결시 장마감 직전 시장가 자동전환)
+        # 05=장전 시간외, 06=장후 시간외
+        if order_type == OrderType.MARKET:
+            ord_dvsn = "01"
+        elif order_type == OrderType.CONDITIONAL:  # 조건부지정가
+            ord_dvsn = "03"
+        else:
+            ord_dvsn = "00"  # 지정가
 
         payload = {
             "CANO": acc_no,
@@ -475,7 +498,7 @@ class KISBroker(BaseBroker):
             "PDNO": symbol,
             "ORD_DVSN": ord_dvsn,
             "ORD_QTY": str(quantity),
-            "ORD_UNPR": str(int(price)) if order_type == OrderType.LIMIT else "0",
+            "ORD_UNPR": str(int(price)) if order_type != OrderType.MARKET else "0",
         }
 
         resp = self._session.post(
@@ -692,7 +715,7 @@ class KISBroker(BaseBroker):
         today = datetime.now().strftime("%Y%m%d")
 
         orders: list[Order] = []
-        for excd in ("NASD", "NYSE"):
+        for excd in ("NAS", "NYS"):
             params = {
                 "CANO": acc_no,
                 "ACNT_PRDT_CD": acc_suffix,
@@ -768,7 +791,17 @@ class KISBroker(BaseBroker):
             "BE",    # Bloom Energy — NYSE
         }
         # DDOG, NVDA, AVGO, MU, AMD, MRVL, AMZN, MSFT, GOOG, TSLA, PLTR, IONQ → NASDAQ (기본값)
+        # 가격조회 API: NAS / NYS 사용
         return "NYS" if symbol.upper() in nyse else "NAS"
+
+    @staticmethod
+    def _get_order_exchange(symbol: str) -> str:
+        """주문 API용 거래소 코드. 가격조회(NAS)와 다름 — 주문은 NASD/NYSE 필요."""
+        nyse = {
+            "BRK", "JPM", "BAC", "GS", "MS", "WMT", "CAT", "GE", "GEV", "LLY", "UNH",
+            "TSM", "VRT", "DELL", "BE",
+        }
+        return "NYSE" if symbol.upper() in nyse else "NASD"
 
     def get_overseas_price(self, symbol: str) -> float:
         excd = self._get_exchange(symbol)
@@ -836,7 +869,7 @@ class KISBroker(BaseBroker):
             else (self.TR_OVERSEAS_SELL_MOCK if self.mock else self.TR_OVERSEAS_SELL_REAL)
         url = f"{self.base_url}/uapi/overseas-stock/v1/trading/order"
         acc_no, acc_suffix = self._split_account()
-        excd = self._get_exchange(symbol)
+        excd = self._get_order_exchange(symbol)  # 주문용: NASD/NYSE
         price = self.get_overseas_price(symbol)
         payload = {
             "CANO": acc_no,
@@ -861,6 +894,31 @@ class KISBroker(BaseBroker):
             if rt_cd != "0" or not order_id:
                 msg = data.get("msg1", "") or data.get("msg_cd", "")
                 logger.warning(f"[KIS] 해외 주문 거부됨: {side.value} {symbol} rt_cd={rt_cd} msg={msg}")
+                # 주문불가 → 해외주식 미신청 가능성 안내
+                if rt_cd == "7" and "주문불가" in msg:
+                    excd_cur = self._get_exchange(symbol)
+                    exchange_name = "NYSE" if excd_cur == "NYS" else "NASDAQ"
+                    logger.warning(
+                        f"[KIS] {symbol} ({exchange_name}) 주문불가 — "
+                        f"KIS 앱 > 해외주식 > {exchange_name} 거래 신청 필요. "
+                        f"또는 해외주식 매매 서비스 미신청 상태일 수 있음. "
+                        f"KIS 앱 > 메뉴 > 계좌관리 > 해외주식 서비스 신청 확인"
+                    )
+                    # 텔레그램 알림 (세션당 최초 1회만)
+                    if not KISBroker._overseas_blocked_notified:
+                        KISBroker._overseas_blocked_notified = True
+                        try:
+                            from notifications.telegram_bot import send_sync
+                            send_sync(
+                                f"⚠️ KIS 해외주식 주문 불가\n"
+                                f"종목: {symbol} ({exchange_name})\n"
+                                f"오류코드: rt_cd={rt_cd}\n\n"
+                                f"📱 KIS 앱에서 해외주식 매매 서비스를 신청해주세요:\n"
+                                f"KIS 앱 → 메뉴 → 계좌관리 → 해외주식 서비스 신청\n"
+                                f"또는 KIS 앱 → 해외주식 → NASDAQ/NYSE 거래신청"
+                            )
+                        except Exception:
+                            pass
                 return Order(symbol=symbol, side=side, order_type=OrderType.LIMIT,
                              quantity=quantity, price=price, status=OrderStatus.REJECTED, raw=data)
             order = Order(

@@ -16,11 +16,20 @@ from database.models import PositionRepository, TradeRepository
 
 DEMO_MODE: bool = os.getenv("DEMO_MODE", "false").lower() == "true"
 SEED_AMOUNT: int = int(os.getenv("SEED_AMOUNT", "2011811"))
-MAX_SLOTS: int = 2                              # 201만원 시드 → 2종목 집중투자
-MAX_PER_SLOT: int = SEED_AMOUNT // MAX_SLOTS   # 종목당 ~100만원
-STOP_LOSS_PCT: float = 2.0                     # 작은 시드 → 손실 빠르게 컷
-TAKE_PROFIT_PCT: float = 5.0
-MAX_DAILY_LOSS: int = int(SEED_AMOUNT * 0.03)  # 일 손실 한도 3% (~6만원)
+
+# ── 마일스톤 기반 자동 모드 전환 ────────────────────────────────────────────
+# 공격 모드 (SEED < 1000만원): 1슬롯 집중 80% 베팅, 데이트레이딩
+# 보존 모드 (SEED >= 1000만원): 2슬롯 분산 45% 배분, 스윙
+MILESTONE_SAFE: int = 10_000_000               # 1000만원 달성 시 보존 모드 전환
+
+def _is_aggressive_mode() -> bool:
+    return SEED_AMOUNT < MILESTONE_SAFE
+
+MAX_SLOTS: int = 1 if _is_aggressive_mode() else 2   # 공격=집중1, 보존=분산2
+MAX_PER_SLOT: int = SEED_AMOUNT // MAX_SLOTS
+STOP_LOSS_PCT: float = 1.5 if _is_aggressive_mode() else 2.0   # 공격=빠른손절
+TAKE_PROFIT_PCT: float = 3.0 if _is_aggressive_mode() else 5.0 # 공격=빠른익절
+MAX_DAILY_LOSS: int = int(SEED_AMOUNT * 0.04)  # 일 손실 한도 4% (공격 모드)
 
 # 매매 모드별 설정
 TRADING_MODE_CONFIG: dict[str, dict[str, Any]] = {
@@ -74,8 +83,9 @@ class TradingEngine:
         self._sell_cooldown: dict[str, float] = {}
         self._SELL_COOLDOWN_SECS: float = 86400.0  # 24시간
 
-        # 매매 모드 (환경변수로 영속화)
-        self.trading_mode: str = os.getenv("TRADING_MODE", "swing")
+        # 매매 모드: 공격 모드(201만→1000만)=day_trading, 보존 모드=swing
+        _default_mode = "day_trading" if _is_aggressive_mode() else "swing"
+        self.trading_mode: str = os.getenv("TRADING_MODE", _default_mode)
         # 트레일링 스탑: {symbol: 최고가}
         self._trailing_stops: dict[str, float] = {}
         # 분할매도 1차 완료: {symbol: 1차매도가}
@@ -278,7 +288,8 @@ class TradingEngine:
 
     def _is_market_hours(self) -> bool:
         now = datetime.now().time()
-        return dtime(9, 0) <= now <= dtime(15, 30)
+        # 08:00 동시호가부터 시작 (주문 접수 → 09:00 개장 시 체결)
+        return dtime(8, 0) <= now <= dtime(15, 30)
 
     def _is_nasdaq_hours(self) -> bool:
         """나스닥 정규장 (서머타임 자동 적용)."""
@@ -629,13 +640,42 @@ class TradingEngine:
             if not signals:
                 return None
 
-            # 점수가 가장 높은 BUY 신호 선택
-            buy_signals = [s for s in signals if s.signal_type.value == "BUY"]
+            # 점수가 가장 높은 BUY 신호 선택 (NYSE 종목 제외 — KIS 주문 불가)
+            from core.broker.kis import KISBroker as _KB
+            NYSE_TICKERS = {"TSM", "GE", "GEV", "VRT", "DELL", "BE", "BRK", "JPM", "BAC", "WMT", "CAT", "LLY", "UNH"}
+            buy_signals = [
+                s for s in signals
+                if s.signal_type.value == "BUY" and s.symbol.upper() not in NYSE_TICKERS
+            ]
             if not buy_signals:
+                # NYSE만 신호 났을 때 → 팩터 점수 기반으로 NASDAQ 종목 직접 선택
+                from core.factor_score import score_ticker, MIN_SCORE_TO_TRADE
+                regime = "bull"
+                best_ticker, best_score = None, 0.0
+                for ticker, data in market_data.items():
+                    if ticker in held:
+                        continue
+                    if ticker.upper() in NYSE_TICKERS:
+                        continue
+                    if not _KB._is_overseas(ticker):
+                        continue
+                    sc = score_ticker(data, regime=regime)
+                    if sc > best_score and sc >= MIN_SCORE_TO_TRADE:
+                        best_score, best_ticker = sc, ticker
+                if best_ticker:
+                    price = market_data[best_ticker].get("current_price", 0)
+                    return {
+                        "decision": "BUY",
+                        "ticker": best_ticker,
+                        "quantity": 1,
+                        "confidence": min(99, int(best_score + 30)),
+                        "reason": f"[FACTOR] 팩터점수 {best_score:.1f}점 — NASDAQ 최고점수",
+                        "score": best_score,
+                        "source": "factor",
+                    }
                 return None
 
             best = max(buy_signals, key=lambda s: s.score)
-            cfg = TRADING_MODE_CONFIG.get(mode, {})
             price = best.price or 0
             qty = max(1, int(MAX_PER_SLOT // price)) if price > 0 else 1
 
@@ -659,10 +699,10 @@ class TradingEngine:
     ) -> dict[str, Any]:
         """전략 신호 + LLM 판단 통합.
 
-        SELL은 LLM 우선.
-        BUY: 전략 BUY + LLM BUY → 전략 신호 채택 (더 구체적인 지표 기반).
-        BUY: 전략 BUY + LLM HOLD → 전략 신호 채택 (기술 지표 신뢰).
-        그 외: LLM 판단 그대로.
+        원칙:
+        - SELL: LLM 무시, _check_stop_conditions 전담
+        - BUY: LLM이 특정 종목을 지목하면 LLM 우선 (LLM이 더 넓은 컨텍스트 가짐)
+               LLM이 HOLD면 전략 신호 채택 (기술 지표 기반)
         """
         # LLM SELL은 무시 — _check_stop_conditions가 손절/익절을 전담
         if llm.get("decision") == "SELL":
@@ -671,13 +711,27 @@ class TradingEngine:
                 "confidence": 0, "reason": f"[LLM SELL 무시 — 자동 손절/익절 위임] {llm.get('reason', '')}",
             }
 
+        NYSE_TICKERS = {"TSM","GE","GEV","VRT","DELL","BE","BRK","JPM","BAC","WMT","CAT","LLY","UNH"}
+
+        # LLM이 NYSE 종목 추천 → 전략 신호로 대체
+        if llm.get("decision") == "BUY" and llm.get("ticker","").upper() in NYSE_TICKERS:
+            logger.info(f"[Engine] LLM이 NYSE 종목 {llm.get('ticker')} 추천 → KIS 주문불가, 전략신호로 대체")
+            if strategy and strategy.get("decision") == "BUY":
+                return dict(strategy)
+            llm = {**llm, "decision": "HOLD", "reason": f"NYSE 종목 {llm.get('ticker')} KIS 주문불가"}
+
+        # LLM이 BUY + NASDAQ 종목 → LLM 우선
+        if llm.get("decision") == "BUY" and llm.get("ticker"):
+            merged = dict(llm)
+            if strategy and strategy.get("decision") == "BUY":
+                merged["reason"] = llm.get("reason", "") + " | 전략점수: " + str(strategy.get("score", 0))
+            return merged
+
+        # LLM HOLD + 전략 BUY → 전략 신호 채택
         if strategy and strategy.get("decision") == "BUY":
-            if llm.get("decision") in ("BUY", "HOLD"):
-                merged = dict(strategy)
-                merged["reason"] = (
-                    strategy.get("reason", "") + " | LLM: " + llm.get("reason", "")
-                )
-                return merged
+            merged = dict(strategy)
+            merged["reason"] = strategy.get("reason", "") + " | LLM HOLD → 전략 우선"
+            return merged
 
         return llm
 
@@ -990,10 +1044,11 @@ class TradingEngine:
                 logger.info(f"[Engine] {ticker} 매수 차단 — 약세장 (QQQ MA200 하단)")
                 return
 
-            # 확신도 70% 미만이면 매수 차단 (매매 품질 향상)
+            # 공격 모드: 확신도 80%+, 보존 모드: 70%+ (고확신 진입만 허용)
             confidence = decision.get("confidence", 0)
-            if confidence < 70:
-                logger.info(f"[Engine] {ticker} 확신도 부족 ({confidence}% < 70%), 매수 건너뜀")
+            min_conf = 80 if _is_aggressive_mode() else 70
+            if confidence < min_conf:
+                logger.info(f"[Engine] {ticker} 확신도 부족 ({confidence}% < {min_conf}%), 매수 건너뜀")
                 return
 
             # 팩터 스코어 필터 (리서치 노트 분할매수는 면제)
@@ -1109,8 +1164,30 @@ class TradingEngine:
                     f"[Engine] {ticker} ATR 손절: {stop_price} / 목표가: {target_price} (위험/보상=1:2)"
                 )
 
+            # 해외주식: 실제 USD 가용 잔고 체크
+            if is_overseas:
+                usd_krw_rate = self.fetcher._broker.get_usd_krw_rate() if is_overseas else 1300.0
+                usd_available = getattr(self.fetcher._broker, "_usd_available", 0.0)
+                if usd_available < current_price:
+                    logger.warning(
+                        f"[Engine] {ticker} 해외주문 불가 — USD 가용잔고 ${usd_available:.0f} < "
+                        f"주문금액 ${current_price:.0f}. KIS 앱에서 KRW→USD 환전 필요"
+                    )
+                    if not getattr(self, "_usd_alert_sent", False):
+                        self._usd_alert_sent = True
+                        from notifications.telegram_bot import send_sync
+                        send_sync(
+                            f"💱 KIS 해외주식 주문 불가 — USD 잔고 부족\n"
+                            f"현재 USD 잔고: ${usd_available:.0f}\n"
+                            f"매수 시도 종목: {ticker} (${current_price:.0f})\n\n"
+                            f"📱 KIS 앱 → 해외주식 → 외화환전\n"
+                            f"원화 → 달러 환전 후 자동 매수가 재개됩니다."
+                        )
+                    return
+            else:
+                usd_krw_rate = 1300.0
+
             # 리스크 패리티 포지션 사이징
-            usd_krw_rate = self.fetcher._broker.get_usd_krw_rate() if is_overseas else 1300.0
             qty = calc_position_size(
                 available_cash=available_cash,
                 entry_price=current_price,
@@ -1125,12 +1202,53 @@ class TradingEngine:
 
             try:
                 broker = self.fetcher._broker
+                tick_data = market_data.get(ticker, {})
+
                 if is_overseas:
+                    # 해외: 현재가 기준 지정가 (KIS 해외는 시장가 미지원)
+                    limit_price_usd = round(current_price, 2)
                     order = broker.buy_overseas_market(ticker, qty)
-                    logger.info(f"[Engine] 해외 매수: {ticker} {qty}주 @ ${current_price:.2f}")
+                    logger.info(f"[Engine] 해외 지정가 매수: {ticker} {qty}주 @ ${limit_price_usd:.2f}")
                 else:
-                    order = broker.buy_market(ticker, qty)
-                    logger.info(f"[Engine] 매수 주문: {ticker} {qty}주 @ {current_price:,.0f}원")
+                    from datetime import datetime as _dt2, time as _t2
+                    _now = _dt2.now().time()
+
+                    if _t2(8, 0) <= _now < _t2(9, 0):
+                        # ── 동시호가(08~09시): 시장가 접수 → 09:00 개장가로 체결 ──
+                        order = broker.buy_market(ticker, qty)
+                        logger.info(f"[Engine] 동시호가 시장가 매수: {ticker} {qty}주 (09:00 개장가 체결)")
+                    else:
+                        # ── 정규장: 퀀트 방식 진입가 계산 ──────────────────────────
+                        # 전략 1: 지지선 근처 → 지지선+0.3% 에서 지정가 대기
+                        support = tick_data.get("support", 0) or 0
+                        near_support = tick_data.get("near_support", False)
+                        pullback = tick_data.get("pullback_detected", False)
+                        vwap = tick_data.get("vwap", 0) or 0
+
+                        if near_support and support > 0 and support < current_price:
+                            # 지지선 바로 위에서 대기 (반등 확인 후 체결)
+                            limit_price = int(support * 1.003)
+                            entry_reason = f"지지선({support:,}) +0.3% 지정가"
+                        elif pullback:
+                            # 눌림목 감지 → 현재가 -0.3% 에서 대기 (추가 하락 흡수)
+                            limit_price = int(current_price * 0.997)
+                            entry_reason = f"눌림목 -0.3% 지정가"
+                        elif vwap > 0 and current_price > vwap * 1.005:
+                            # VWAP 대비 과도 이격 → VWAP+0.5% 에서 대기
+                            limit_price = int(vwap * 1.005)
+                            entry_reason = f"VWAP({vwap:,.0f}) +0.5% 지정가"
+                        else:
+                            # 모멘텀 진입 → 현재가 -0.1% (슬리피지 최소화)
+                            limit_price = int(current_price * 0.999)
+                            entry_reason = f"모멘텀 -0.1% 지정가"
+
+                        # 조건부지정가: 당일 미체결 시 장마감(15:20) 직전 시장가 자동 전환
+                        # → 체결 기회 최대화 + 가격 개선 시도 동시에
+                        order = broker.buy_conditional(ticker, qty, limit_price)
+                        logger.info(
+                            f"[Engine] 조건부지정가 매수: {ticker} {qty}주 @ {limit_price:,}원 "
+                            f"({entry_reason}) | 미체결 시 15:20 시장가 전환"
+                        )
 
                 from core.broker.kis import OrderStatus as KOrderStatus
                 if order.status == KOrderStatus.REJECTED:
@@ -1188,8 +1306,11 @@ class TradingEngine:
                     sell_order = broker.sell_overseas_market(ticker, sell_qty)
                     logger.info(f"[Engine] 해외 매도: {ticker} {sell_qty}주 @ ${current_price:.2f}")
                 else:
-                    sell_order = broker.sell_market(ticker, sell_qty)
-                    logger.info(f"[Engine] 매도 주문: {ticker} {sell_qty}주 @ {current_price:,.0f}원")
+                    # 조건부지정가 매도: 현재가 지정가 접수 → 미체결 시 15:20 시장가 자동 전환
+                    # (손절 타이밍 놓침 방지 + 체결 보장)
+                    limit_price = int(current_price)
+                    sell_order = broker.sell_conditional(ticker, sell_qty, limit_price)
+                    logger.info(f"[Engine] 조건부지정가 매도: {ticker} {sell_qty}주 @ {limit_price:,}원 | 미체결 시 15:20 시장가 전환")
 
                 from core.broker.kis import OrderStatus as KOrderStatus
                 if sell_order.status == KOrderStatus.REJECTED:
@@ -1255,8 +1376,9 @@ class TradingEngine:
     async def _update_seed_amount(self, force: bool = False) -> None:
         """실제 KIS 잔고로 SEED_AMOUNT 갱신 (복리 운용).
         force=True: 시작시 강제 갱신 (1% 제한 없음).
+        마일스톤 1000만원 달성 시 공격→보존 모드 자동 전환.
         """
-        global SEED_AMOUNT, MAX_PER_SLOT
+        global SEED_AMOUNT, MAX_SLOTS, MAX_PER_SLOT, STOP_LOSS_PCT, TAKE_PROFIT_PCT, MAX_DAILY_LOSS
         try:
             bal = self.fetcher._broker.get_balance()
             new_seed = int(bal.total_equity) if bal.total_equity and bal.total_equity > 0 else 0
@@ -1264,8 +1386,38 @@ class TradingEngine:
                 return
             if force or new_seed != SEED_AMOUNT:
                 old = SEED_AMOUNT
+                was_aggressive = old < MILESTONE_SAFE
                 SEED_AMOUNT = new_seed
+                is_aggressive = SEED_AMOUNT < MILESTONE_SAFE
+
+                # 마일스톤 달성: 공격 → 보존 모드 자동 전환
+                if was_aggressive and not is_aggressive:
+                    MAX_SLOTS = 2
+                    STOP_LOSS_PCT = 2.0
+                    TAKE_PROFIT_PCT = 5.0
+                    from core.risk_manager import SLOT_ALLOCATION_PCT_SAFE
+                    import core.risk_manager as _rm
+                    _rm.SLOT_ALLOCATION_PCT = _rm.SLOT_ALLOCATION_PCT_SAFE
+                    self.trading_mode = "swing"
+                    logger.info(
+                        f"[Engine] 🎉 1000만원 달성! 공격→보존 모드 자동 전환 "
+                        f"(슬롯 1→2, 배분 80%→45%, 스윙 모드)"
+                    )
+                    from notifications.telegram_bot import _send
+                    asyncio.create_task(_safe(_send(
+                        "🎉 <b>1,000만원 달성!</b>\n"
+                        "공격 모드 → 보존 모드 자동 전환\n"
+                        "슬롯 1→2 / 배분 80%→45% / 스윙 모드\n"
+                        "이제 수익을 지키는 전략으로 운용합니다."
+                    )))
+                elif is_aggressive:
+                    MAX_SLOTS = 1
+                    STOP_LOSS_PCT = 1.5
+                    TAKE_PROFIT_PCT = 3.0
+
+                MAX_DAILY_LOSS = int(SEED_AMOUNT * 0.04)
                 MAX_PER_SLOT = SEED_AMOUNT // MAX_SLOTS
+
                 # .env 저장
                 _env_path = os.path.join(os.path.dirname(__file__), "..", ".env")
                 with open(_env_path, "r", encoding="utf-8") as f:
@@ -1280,7 +1432,11 @@ class TradingEngine:
                     lines.append(f"SEED_AMOUNT={SEED_AMOUNT}\n")
                 with open(_env_path, "w", encoding="utf-8") as f:
                     f.writelines(lines)
-                logger.info(f"[Engine] 잔고 갱신: {old:,} → {SEED_AMOUNT:,}원 (종목당 {MAX_PER_SLOT:,}원)")
+                mode_tag = "공격" if is_aggressive else "보존"
+                logger.info(
+                    f"[Engine] 잔고 갱신: {old:,} → {SEED_AMOUNT:,}원 "
+                    f"({mode_tag}모드 | 슬롯당 {MAX_PER_SLOT:,}원)"
+                )
         except Exception as e:
             logger.debug(f"[Engine] 잔고 갱신 실패 (무시): {e}")
 

@@ -165,6 +165,18 @@ SYSTEM_PROMPT = """당신은 올랜도킴 매매 전략을 따르는 AI 트레�
 - 종목당 최대 25만원
 - 일 손실 한도 3만원 초과 시 당일 매매 중단
 
+### ⚠️ KIS 증권 주문 불가 종목 (NYSE 상장 — 절대 BUY 금지)
+아래 종목들은 현재 KIS 계좌에서 NYSE 거래 권한이 없어 주문이 거부됩니다.
+이 종목들에 대해서는 절대로 BUY 결정을 내리지 마세요:
+- TSM (Taiwan Semiconductor — NYSE)
+- GE (GE Aerospace — NYSE)
+- VRT (Vertiv Holdings — NYSE)
+- DELL (Dell Technologies — NYSE)
+- BE (Bloom Energy — NYSE)
+- GEV (GE Vernova — NYSE)
+
+BUY 추천 가능한 종목 (NASDAQ): NVDA, MSFT, AMZN, AVGO, MRVL, MU, AMD, TSLA, GOOG, DDOG, SNDK, NBIS
+
 ## 응답 형식 (반드시 JSON만 반환)
 {
   "decision": "BUY" | "SELL" | "HOLD",
@@ -587,6 +599,8 @@ class LLMJudge:
         lines.append(
             f"\n현재 매매 모드는 **{mode_label}**입니다. "
             "위 데이터를 바탕으로 현재 모드의 전략 규칙에 따라 "
-            "지금 당장 실행할 최선의 매매 판단을 JSON으로 반환하세요."
+            "지금 당장 실행할 최선의 매매 판단을 JSON으로 반환하세요.\n"
+            "⚠️ 중요: TSM, GE, VRT, DELL, BE, GEV는 KIS NYSE 주문불가 — 절대 BUY 금지. "
+            "NASDAQ 종목(NVDA, MSFT, AMZN, AVGO, MRVL, MU, AMD, TSLA, GOOG, DDOG, SNDK)만 BUY 가능."
         )
         return "\n".join(lines)

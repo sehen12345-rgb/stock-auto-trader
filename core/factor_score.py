@@ -73,8 +73,8 @@ WEIGHTS = {
 }
 
 # 이 점수 미만이면 LLM에 넘기지 않고 HOLD
-# 201만원 소액 시드: 확실한 셋업만 진입 → 기준 높임
-MIN_SCORE_TO_TRADE: float = 58.0
+# 52점: 너무 빡빡하지 않으면서 애매한 셋업 걸러냄
+MIN_SCORE_TO_TRADE: float = 52.0
 
 
 def score_ticker(data: dict[str, Any], regime: str = "neutral") -> float:
@@ -156,9 +156,13 @@ def score_ticker(data: dict[str, Any], regime: str = "neutral") -> float:
     elif vol_ratio >= 1.5:
         volume += 30
     elif vol_ratio >= 1.2:
-        volume += 15
-    elif vol_ratio < 0.7:
-        volume -= 10  # 거래량 급감 패널티 (슬리피지 위험)
+        volume += 20
+    elif vol_ratio >= 0.8:
+        volume += 10  # 평균 근처 → 소폭 가산
+    elif vol_ratio >= 0.5:
+        volume += 0   # 낮지만 패널티 없음
+    elif vol_ratio < 0.5:
+        volume -= 10  # 거래량 절반 미만일 때만 패널티
 
     if above_poc:
         volume += 25  # 매물대(POC) 위에서 거래 → 돌파

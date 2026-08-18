@@ -8,6 +8,7 @@ from typing import Any
 class OrderType(Enum):
     MARKET = "MARKET"
     LIMIT = "LIMIT"
+    CONDITIONAL = "CONDITIONAL"  # 조건부지정가: 당일 미체결 시 장마감 직전 시장가 전환
 
 
 class OrderSide(Enum):

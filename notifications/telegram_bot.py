@@ -70,6 +70,19 @@ async def _send(text: str) -> None:
         logger.warning(f"[Telegram] 전송 실패: {e}")
 
 
+def send_sync(text: str) -> None:
+    """동기 컨텍스트에서 텔레그램 메시지 전송 (비동기 루프 없이 호출 가능)."""
+    import asyncio
+    try:
+        loop = asyncio.get_event_loop()
+        if loop.is_running():
+            asyncio.ensure_future(_send(text))
+        else:
+            loop.run_until_complete(_send(text))
+    except Exception as e:
+        logger.debug(f"[Telegram] send_sync 실패: {e}")
+
+
 async def notify_start() -> None:
     now = datetime.now().strftime("%H:%M:%S")
     await _send(
